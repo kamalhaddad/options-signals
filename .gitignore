@@ -7,3 +7,6 @@ venv/
 
 # ThetaData response cache
 .cache/
+
+# generated per-run report
+backtest.log

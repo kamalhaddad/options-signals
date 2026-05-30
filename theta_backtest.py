@@ -341,6 +341,8 @@ def main():
     ap.add_argument("--end", required=True, help="YYYY-MM-DD")
     ap.add_argument("--workers", type=int, default=8, help="concurrent tickers (default 8)")
     ap.add_argument("--dump", default=None, help="write structured trades to this JSON path")
+    ap.add_argument("--log", default="backtest.log", help="human-readable report path (default backtest.log)")
+    ap.add_argument("--no-log", action="store_true", help="don't write the report file")
     ap.add_argument("--stop", type=float, default=sc.STOP_LOSS_PREMIUM_PCT, help="stop-loss %% on premium")
     ap.add_argument("--tp", type=float, default=sc.TAKE_PROFIT_PREMIUM_PCT, help="take-profit %% on premium")
     ap.add_argument("--signals", default="trend_clean", choices=list(SIGNAL_PRESETS), help="signal preset")
@@ -383,12 +385,20 @@ def main():
         nu = sum(1 for v in market_regime.values() if v == 0)
         print(f"  market-gate ON ({MARKET_INDEX}): {b} bull / {s_} bear / {nu} neutral bars")
 
+    # emit() prints to stdout AND captures the line for the report file.
+    report: list[str] = []
+    def emit(s=""):
+        print(s)
+        report.append(s)
+
     all_trades: list[dict] = []
-    print(f"{'='*118}")
-    print(f"  REAL-OPTIONS BACKTEST (ThetaData)  {args.start} -> {args.end}  ({len(tickers)} tickers, {args.workers} workers)")
-    print(f"  Buy>={sc.BUY_THRESHOLD} Sell<={sc.SELL_THRESHOLD} | SL -{sc.STOP_LOSS_PREMIUM_PCT}% / "
-          f"TP +{sc.TAKE_PROFIT_PREMIUM_PCT}% on premium | enter@ask exit@bid +${COMMISSION_PER_CONTRACT}/ct")
-    print(f"{'='*118}")
+    emit(f"{'='*118}")
+    emit(f"  REAL-OPTIONS BACKTEST (ThetaData)  {args.start} -> {args.end}  ({len(tickers)} tickers, {args.workers} workers)")
+    emit(f"  Buy>={sc.BUY_THRESHOLD} Sell<={sc.SELL_THRESHOLD} | SL -{sc.STOP_LOSS_PREMIUM_PCT}% / "
+         f"TP +{sc.TAKE_PROFIT_PREMIUM_PCT}% on premium | spread<{args.max_spread}% OI>={args.min_oi} | "
+         f"enter@ask exit@bid +{args.slippage}% slip +${COMMISSION_PER_CONTRACT}/ct")
+    emit(f"  signals={args.signals} adx>{args.adx_gate} risk=${args.risk}")
+    emit(f"{'='*118}")
 
     def run_one(tk):
         # Each ticker gets its own client/caches (thread-safe isolation).
@@ -427,9 +437,9 @@ def main():
         with open(args.dump, "w") as f:
             json.dump(serializable, f, indent=2)
         print(f"  (dumped {len(serializable)} trades -> {args.dump})")
-    print(f"\n  {'#':<3} {'Tkr':<5} {'Type':<4} {'Strike':<8} {'Exp':<10} {'Entry@ask':<18} "
-          f"{'Exit@bid':<18} {'P&L%':<8} {'$P&L':<8} {'Reason'}")
-    print(f"  {'-'*3} {'-'*5} {'-'*4} {'-'*8} {'-'*10} {'-'*18} {'-'*18} {'-'*8} {'-'*8} {'-'*20}")
+    emit(f"\n  {'#':<3} {'Tkr':<5} {'Type':<4} {'Strike':<8} {'Exp':<10} {'Entry@ask':<18} "
+         f"{'Exit@bid':<18} {'P&L%':<8} {'$P&L':<8} {'Reason'}")
+    emit(f"  {'-'*3} {'-'*5} {'-'*4} {'-'*8} {'-'*10} {'-'*18} {'-'*18} {'-'*8} {'-'*8} {'-'*20}")
     win_pcts, loss_pcts = [], []
     tot_pct = 0.0
     tot_usd = 0.0
@@ -437,23 +447,31 @@ def main():
         tot_pct += tr["pnl_pct"]; tot_usd += tr["pnl_usd"]
         (win_pcts if tr["pnl_pct"] > 0 else loss_pcts).append(tr["pnl_pct"])
         exp_s = exp_to_date(tr["exp"]).strftime("%Y-%m-%d")
-        print(f"  {i:<3} {tr['ticker']:<5} {tr['type']:<4} ${tr['strike']:<7.0f} {exp_s:<10} "
-              f"${tr['entry']:<6.2f} {tr['entry_time'].strftime('%m/%d %H:%M'):<11} "
-              f"${tr['exit']:<6.2f} {tr['exit_time'].strftime('%m/%d %H:%M'):<11} "
-              f"{tr['pnl_pct']:+.1f}%{'':<2} ${tr['pnl_usd']:+.0f}{'':<3} {tr['reason']}")
+        emit(f"  {i:<3} {tr['ticker']:<5} {tr['type']:<4} ${tr['strike']:<7.0f} {exp_s:<10} "
+             f"${tr['entry']:<6.2f} {tr['entry_time'].strftime('%m/%d %H:%M'):<11} "
+             f"${tr['exit']:<6.2f} {tr['exit_time'].strftime('%m/%d %H:%M'):<11} "
+             f"{tr['pnl_pct']:+.1f}%{'':<2} ${tr['pnl_usd']:+.0f}{'':<3} {tr['reason']}")
     n = len(all_trades)
     avg_win = sum(win_pcts) / len(win_pcts) if win_pcts else 0.0
     avg_loss = sum(loss_pcts) / len(loss_pcts) if loss_pcts else 0.0
     wl = (avg_win / -avg_loss) if avg_loss else 0.0
     expectancy = tot_pct / n if n else 0.0
-    print(f"\n  {'='*64}")
-    print(f"  SUMMARY  (per-trade % return on premium — the edge metric)")
-    print(f"  {'='*64}")
-    print(f"  Trades:      {n}   |   Win rate: {(len(win_pcts)/n*100 if n else 0):.0f}%")
-    print(f"  Avg/trade:   {expectancy:+.1f}%   <-- expectancy per trade")
-    print(f"  Avg win:     {avg_win:+.1f}%   |   Avg loss: {avg_loss:+.1f}%   |   W:L {wl:.2f}x")
-    print(f"  Total:       {tot_pct:+.0f}% (sum of per-trade %, 1-ct equal-weight)   |   ${tot_usd:+.0f} net")
-    print(f"  {'='*64}")
+    emit(f"\n  {'='*64}")
+    emit(f"  SUMMARY  (per-trade % return on premium — the edge metric)")
+    emit(f"  {'='*64}")
+    emit(f"  Trades:      {n}   |   Win rate: {(len(win_pcts)/n*100 if n else 0):.0f}%")
+    emit(f"  Avg/trade:   {expectancy:+.1f}%   <-- expectancy per trade")
+    emit(f"  Avg win:     {avg_win:+.1f}%   |   Avg loss: {avg_loss:+.1f}%   |   W:L {wl:.2f}x")
+    emit(f"  Total:       {tot_pct:+.0f}% (sum of per-trade %, 1-ct equal-weight)   |   ${tot_usd:+.0f} net")
+    emit(f"  {'='*64}")
+
+    # Persist the human-readable report (default: backtest.log; overwritten each run).
+    if not args.no_log:
+        from datetime import datetime as _dt
+        with open(args.log, "w") as f:
+            f.write(f"ThetaData real-options backtest — {_dt.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("\n".join(report) + "\n")
+        print(f"\n  report -> {args.log}")
 
 
 if __name__ == "__main__":
