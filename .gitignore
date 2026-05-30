@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+*.credentials
+
+# ThetaData response cache
+.cache/

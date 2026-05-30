@@ -10,7 +10,12 @@ options-signals/
 ├── signals.py        # Technical indicator engine (RSI, MACD, EMA, BB, StochRSI, Volume)
 ├── options.py        # Options chain analysis (contract picker, IV rank, P/C ratio, unusual volume)
 ├── backtest.py       # Utility: intraday data fetching and per-bar signal computation
-├── show_trades.py    # Backtest runner — simulates trades and outputs results + log file
+├── show_trades.py    # Backtest runner (yfinance, delta-approx P&L) — quick/free sanity tool
+├── strategy_core.py  # Self-contained, parity-verified copy of the signal engine (shared)
+├── thetadata_client.py # REST client for the local ThetaData Terminal (stock/option/greeks)
+├── theta_backtest.py # Best-in-class backtest on REAL ThetaData option prices (see below)
+├── STRATEGY.md       # ⭐ Tuned strategy, winning config (= defaults), findings & honest perf — READ FIRST
+├── test_parity.py    # Verifies strategy_core matches the original engine exactly
 ├── config.py         # All tunable parameters (thresholds, weights, watchlist, indicator periods)
 ├── Dockerfile        # Container for deployment
 ├── docker-compose.yml
@@ -59,13 +64,28 @@ When a signal fires, `options.py` picks the optimal contract:
 
 ## Key Commands
 
-### Run backtest
+### Run backtest — real options data (ThetaData) ⭐ best-in-class
+Uses REAL underlying bars, the REAL option chain, and REAL per-bar bid/ask. Fills
+enter at ask / exit at bid (+$0.65/contract); premium-based −25%/+40% exits; CALLs
+on BUY, PUTs on bearish. Needs the **ThetaData Terminal** running locally:
+```bash
+# 1) Start the ThetaData Terminal (keep it running; binds 127.0.0.1:25510)
+java -jar ~/ThetaTerminal.jar <email> <password>
+# 2) Run the backtest (any historical date range ThetaData covers)
+.venv/bin/python theta_backtest.py --tickers NVDA --start 2024-03-04 --end 2024-03-08
+.venv/bin/python theta_backtest.py --tickers NVDA,AAPL,SPY --start 2024-03-01 --end 2024-03-29
+```
+Notes: runs on the host (no Docker) so the Terminal's single-client-IP lock stays
+consistent. `strategy_core.py` holds the (parity-verified) signal engine; verify it
+still matches the original with `.venv/bin/python test_parity.py`.
+
+### Run backtest — quick/free (yfinance, delta-approx P&L)
 ```bash
 python show_trades.py                # last 24 hours
 python show_trades.py --hours 72     # last 3 days
 python show_trades.py --hours 120    # last 5 days (max for 5-min candles)
 ```
-Outputs a table to stdout and writes detailed log to `backtest.log`.
+Optimistic (no theta/gamma/real fills) — use as a fast sanity check, not for truth.
 
 ### Run the Discord bot
 ```bash
