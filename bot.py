@@ -16,7 +16,7 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta, time as dtime
 
 import discord
 from discord.ext import commands, tasks
@@ -40,9 +40,23 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 def load_state() -> dict:
     try:
         with open(POSITIONS_FILE) as f:
-            return json.load(f)
+            state = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"positions": {}, "cooldowns": {}}
+        state = {}
+    state.setdefault("positions", {})
+    state.setdefault("cooldowns", {})
+    state.setdefault("closed", [])           # closed-trade history (for the EOD summary)
+    state.setdefault("summary_posted", "")   # date of the last posted daily summary
+    return state
+
+
+def record_closed(state: dict, pos: dict, exit_bid, reason: str, now) -> None:
+    pnl = ((exit_bid - pos["entry"]) / pos["entry"] * 100) if (exit_bid and pos.get("entry")) else 0.0
+    state["closed"].append({
+        "date": now.strftime("%Y-%m-%d"), "ticker": pos["ticker"], "dir": pos["dir"],
+        "strike_d": pos["strike_d"], "entry": pos["entry"], "exit": exit_bid or 0.0,
+        "pnl_pct": pnl, "reason": reason,
+    })
 
 
 def save_state(state: dict) -> None:
@@ -90,6 +104,54 @@ def exit_embed(pos: dict, reason: str, exit_bid: float | None) -> discord.Embed:
     return e
 
 
+def summary_embed(date_str: str, trades: list) -> discord.Embed:
+    """End-of-day recap: ✅ wins / ❌ losses + total P&L %."""
+    wins = [t for t in trades if t["pnl_pct"] > 0]
+    total = sum(t["pnl_pct"] for t in trades)
+    color = discord.Color.green() if total >= 0 else discord.Color.red()
+    e = discord.Embed(title=f"\U0001f4ca Daily Summary — {date_str}", color=color, timestamp=datetime.now())
+    if not trades:
+        e.description = "No trades today."
+        return e
+    lines = []
+    for t in trades:
+        mark = "✅" if t["pnl_pct"] > 0 else "❌"
+        lines.append(f"{mark} **{t['ticker']}** {t['dir']} ${t['strike_d']:.0f}  →  {t['pnl_pct']:+.0f}%")
+    body = "\n".join(lines)
+    if len(body) > 1000:                                   # Discord field cap; keep it safe
+        keep = lines[:24]
+        body = "\n".join(keep) + f"\n… +{len(lines) - len(keep)} more"
+    e.add_field(name=f"Trades ({len(trades)})", value=body, inline=False)
+    e.add_field(name="Win rate", value=f"{len(wins)}/{len(trades)} ({len(wins)/len(trades)*100:.0f}%)", inline=True)
+    e.add_field(name="Total P&L", value=f"**{total:+.0f}%**", inline=True)
+    e.set_footer(text="Sum of per-trade % • educational, not financial advice")
+    return e
+
+
+def eod_collect():
+    """After market close: flatten any straggler positions, mark the day done, and return
+    (date, today's trades) — or None if it's not after-close yet or already summarized.
+    Runs in a worker thread (touches ThetaData/disk)."""
+    now = session.now_et()
+    today = now.strftime("%Y-%m-%d")
+    if now.weekday() >= 5 or now.time() < dtime(16, 0) or session.is_market_open(now):
+        return None
+    state = load_state()
+    if state.get("summary_posted") == today:
+        return None
+    if state["positions"]:                                 # safety net: close anything still open
+        eng = LiveEngine()
+        for tk, pos in list(state["positions"].items()):
+            bid = eng.current_bid(tk, pos["exp"], pos["strike"], pos["right"])
+            record_closed(state, pos, bid, "end of day", now)
+            del state["positions"][tk]
+    state["summary_posted"] = today
+    cutoff = (now - timedelta(days=10)).strftime("%Y-%m-%d")  # prune old history
+    state["closed"] = [c for c in state["closed"] if c.get("date", "") >= cutoff]
+    save_state(state)
+    return today, [c for c in state["closed"] if c.get("date") == today]
+
+
 def config_tp():
     import strategy_core as sc
     return sc.TAKE_PROFIT_PREMIUM_PCT
@@ -127,6 +189,7 @@ def scan() -> list[tuple[str, discord.Embed]]:
             if reason:
                 bid = eng.current_bid(tk, pos["exp"], pos["strike"], pos["right"])
                 out.append(("exit", exit_embed(pos, reason, bid)))
+                record_closed(state, pos, bid, reason, now)
                 del positions[tk]
                 cooldowns[tk] = now.timestamp() + COOLDOWN_MIN * 60
             continue
@@ -160,6 +223,8 @@ async def on_ready():
     log.info(f"Connected as {bot.user} | watching {len(config.WATCHLIST)} tickers | scan {config.SCAN_INTERVAL_MINUTES}m")
     if not scanner_loop.is_running():
         scanner_loop.start()
+    if not eod_loop.is_running():
+        eod_loop.start()
 
 
 @tasks.loop(minutes=config.SCAN_INTERVAL_MINUTES)
@@ -181,6 +246,28 @@ async def scanner_loop():
 
 @scanner_loop.before_loop
 async def _before():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(minutes=10)
+async def eod_loop():
+    """Posts the daily summary once, shortly after the close (skips zero-trade days)."""
+    channel = bot.get_channel(config.CHANNEL_ID)
+    if channel is None:
+        return
+    res = await asyncio.to_thread(eod_collect)
+    if res is None:
+        return
+    date_str, trades = res
+    if not trades:
+        log.info(f"{date_str}: no trades — no summary")
+        return
+    await channel.send(embed=summary_embed(date_str, trades))
+    log.info(f"posted EOD summary for {date_str}: {len(trades)} trades")
+
+
+@eod_loop.before_loop
+async def _before_eod():
     await bot.wait_until_ready()
 
 
@@ -213,6 +300,14 @@ async def positions_cmd(ctx):
     lines = [f"• **{p['ticker']}** {p['dir']} ${p['strike_d']:.0f} {p['exp_date']} @ ${p['entry']:.2f} "
              f"(since {p['entry_time']})" for p in pos.values()]
     await ctx.send("\U0001f4ca **Open positions:**\n" + "\n".join(lines))
+
+
+@bot.command(name="summary")
+async def summary_cmd(ctx):
+    """!summary — today's closed trades so far (✅/❌ + total P&L%)."""
+    today = session.now_et().strftime("%Y-%m-%d")
+    trades = [c for c in load_state()["closed"] if c.get("date") == today]
+    await ctx.send(embed=summary_embed(today, trades))
 
 
 @bot.command(name="status")
