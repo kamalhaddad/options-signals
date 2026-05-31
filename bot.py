@@ -45,8 +45,9 @@ def load_state() -> dict:
         state = {}
     state.setdefault("positions", {})
     state.setdefault("cooldowns", {})
-    state.setdefault("closed", [])           # closed-trade history (for the EOD summary)
-    state.setdefault("summary_posted", "")   # date of the last posted daily summary
+    state.setdefault("closed", [])               # closed-trade history (for the summaries)
+    state.setdefault("summary_posted", "")       # date of the last posted DAILY summary
+    state.setdefault("week_summary_posted", "")  # ISO week of the last posted WEEKLY summary
     return state
 
 
@@ -146,10 +147,67 @@ def eod_collect():
             record_closed(state, pos, bid, "end of day", now)
             del state["positions"][tk]
     state["summary_posted"] = today
-    cutoff = (now - timedelta(days=10)).strftime("%Y-%m-%d")  # prune old history
+    cutoff = (now - timedelta(days=12)).strftime("%Y-%m-%d")  # prune old history (keep >1 week)
     state["closed"] = [c for c in state["closed"] if c.get("date", "") >= cutoff]
     save_state(state)
     return today, [c for c in state["closed"] if c.get("date") == today]
+
+
+def weekly_summary_embed(week_label: str, trades: list) -> discord.Embed:
+    """Friday recap of the whole week: per-day breakdown + totals (✅/❌ + total P&L%)."""
+    wins = [t for t in trades if t["pnl_pct"] > 0]
+    total = sum(t["pnl_pct"] for t in trades)
+    color = discord.Color.green() if total >= 0 else discord.Color.red()
+    e = discord.Embed(title=f"\U0001f4c5 Weekly Summary — {week_label}", color=color, timestamp=datetime.now())
+    if not trades:
+        e.description = "No trades this week."
+        return e
+    by_day: dict = {}
+    for t in trades:
+        by_day.setdefault(t["date"], []).append(t)
+    day_lines = []
+    for d in sorted(by_day):
+        dts = by_day[d]
+        dtot = sum(x["pnl_pct"] for x in dts)
+        dw = sum(1 for x in dts if x["pnl_pct"] > 0)
+        dow = datetime.strptime(d, "%Y-%m-%d").strftime("%a")
+        mark = "✅" if dtot >= 0 else "❌"
+        day_lines.append(f"{mark} {dow} {d[5:]} — {len(dts)} trades · {dw}/{len(dts)}W · **{dtot:+.0f}%**")
+    e.add_field(name="By day", value="\n".join(day_lines), inline=False)
+    e.add_field(name="Trades", value=str(len(trades)), inline=True)
+    e.add_field(name="Win rate", value=f"{len(wins)}/{len(trades)} ({len(wins)/len(trades)*100:.0f}%)", inline=True)
+    e.add_field(name="Total P&L", value=f"**{total:+.0f}%**", inline=True)
+    best, worst = max(trades, key=lambda x: x["pnl_pct"]), min(trades, key=lambda x: x["pnl_pct"])
+    e.add_field(name="Best / Worst",
+                value=f"✅ {best['ticker']} {best['dir']} {best['pnl_pct']:+.0f}%   /   "
+                      f"❌ {worst['ticker']} {worst['dir']} {worst['pnl_pct']:+.0f}%", inline=False)
+    e.set_footer(text="Sum of per-trade % • educational, not financial advice")
+    return e
+
+
+def _week_bounds(now):
+    """ISO-week label + (monday, friday) date strings for the week containing `now`."""
+    iso = now.isocalendar()
+    wd = now.weekday()                               # 0=Mon … 6=Sun
+    monday = now - timedelta(days=wd)
+    return f"{iso[0]}-W{iso[1]:02d}", monday.strftime("%Y-%m-%d"), (monday + timedelta(days=4)).strftime("%Y-%m-%d")
+
+
+def weekly_collect():
+    """After Friday's close (through the weekend): post the week's recap once. Returns
+    (week_label, week_trades) or None. Runs in a worker thread."""
+    now = session.now_et()
+    wd = now.weekday()
+    after_friday_close = (wd == 4 and now.time() >= dtime(16, 0)) or wd in (5, 6)
+    if not after_friday_close:
+        return None
+    week_label, monday, friday = _week_bounds(now)
+    state = load_state()
+    if state.get("week_summary_posted") == week_label:
+        return None
+    state["week_summary_posted"] = week_label
+    save_state(state)
+    return week_label, [c for c in state["closed"] if monday <= c.get("date", "") <= friday]
 
 
 def config_tp():
@@ -251,19 +309,29 @@ async def _before():
 
 @tasks.loop(minutes=10)
 async def eod_loop():
-    """Posts the daily summary once, shortly after the close (skips zero-trade days)."""
+    """After the close: post the DAILY recap (any weekday) and, on Friday, the WEEKLY recap.
+    Each fires once; zero-trade days/weeks are skipped."""
     channel = bot.get_channel(config.CHANNEL_ID)
     if channel is None:
         return
+    # daily — also flattens any straggler positions before summarizing
     res = await asyncio.to_thread(eod_collect)
-    if res is None:
-        return
-    date_str, trades = res
-    if not trades:
-        log.info(f"{date_str}: no trades — no summary")
-        return
-    await channel.send(embed=summary_embed(date_str, trades))
-    log.info(f"posted EOD summary for {date_str}: {len(trades)} trades")
+    if res is not None:
+        date_str, trades = res
+        if trades:
+            await channel.send(embed=summary_embed(date_str, trades))
+            log.info(f"posted daily summary {date_str}: {len(trades)} trades")
+        else:
+            log.info(f"{date_str}: no trades — no daily summary")
+    # weekly — Friday after close (runs after the daily flatten, so Friday's trades are in)
+    wres = await asyncio.to_thread(weekly_collect)
+    if wres is not None:
+        week_label, wtrades = wres
+        if wtrades:
+            await channel.send(embed=weekly_summary_embed(week_label, wtrades))
+            log.info(f"posted weekly summary {week_label}: {len(wtrades)} trades")
+        else:
+            log.info(f"{week_label}: no trades — no weekly summary")
 
 
 @eod_loop.before_loop
@@ -308,6 +376,14 @@ async def summary_cmd(ctx):
     today = session.now_et().strftime("%Y-%m-%d")
     trades = [c for c in load_state()["closed"] if c.get("date") == today]
     await ctx.send(embed=summary_embed(today, trades))
+
+
+@bot.command(name="weeksummary")
+async def weeksummary_cmd(ctx):
+    """!weeksummary — this week's closed trades so far (per-day + total P&L%)."""
+    label, monday, friday = _week_bounds(session.now_et())
+    trades = [c for c in load_state()["closed"] if monday <= c.get("date", "") <= friday]
+    await ctx.send(embed=weekly_summary_embed(label, trades))
 
 
 @bot.command(name="status")
