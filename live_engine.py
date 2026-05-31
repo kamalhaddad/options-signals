@@ -1,0 +1,156 @@
+"""
+Live signal engine — the TUNED backtest strategy, evaluated on the latest bar.
+
+This is the bridge between `theta_backtest.py` (which the strategy was tuned on) and the
+live Discord bot. It reuses the parity-verified pieces so live signals match the backtest:
+  - `strategy_core.compute_signals_series` with the `trend_clean` weights (incl. ADX + VWAP)
+  - `ThetaBacktest.pick_contract` / option quotes / OI / IV for contract selection
+  - the same entry gates (ADX>30, symmetric PUT) and premium-based exits (+40% / -50%)
+
+It does NOT re-run history each tick beyond the warmup window — it fetches today's 5-min
+bars (+ a few warmup days) and reads the latest CLOSED bar. Session rules (trade the open,
+no new entries after 12:00 ET, flatten by EOD) live in `session.py`.
+"""
+from __future__ import annotations
+import math
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+
+import strategy_core as sc
+import theta_backtest as tb
+from thetadata_client import ThetaClient, strike_to_dollars
+
+ET = ZoneInfo("America/New_York")
+WARMUP_CALENDAR_DAYS = tb.WARMUP_CALENDAR_DAYS
+MIN_BARS = 40
+
+
+def today_et() -> int:
+    return int(datetime.now(ET).strftime("%Y%m%d"))
+
+
+class LiveEngine:
+    """Stateless evaluator: given a ticker, returns the latest-bar signal + contract pick.
+    Position state and exit bookkeeping live in the bot; this just mirrors the backtest math."""
+
+    def __init__(self, client: ThetaClient | None = None, signals: str = "trend_clean",
+                 adx_gate: float = 30.0, moneyness: float = tb.OTM_TARGET_PCT,
+                 max_spread: float = tb.MAX_SPREAD_PCT, min_premium: float = tb.MIN_PREMIUM,
+                 min_oi: int = tb.MIN_OPEN_INTEREST):
+        self.bt = tb.ThetaBacktest(client or ThetaClient())
+        self.weights = tb.SIGNAL_PRESETS[signals]
+        n_active = sum(1 for w in self.weights.values() if w > 0)
+        self.required = math.ceil(sc.MIN_BULLISH_INDICATORS / 6 * n_active)
+        self.adx_gate = adx_gate
+        self.moneyness = moneyness
+        self.max_spread = max_spread
+        self.min_premium = min_premium
+        self.min_oi = min_oi
+
+    # ── signal ────────────────────────────────────────────────────────────────
+    def latest(self, ticker: str, date_i: int | None = None) -> dict | None:
+        """Latest-bar signal state for `ticker` (today's bars + warmup). None if insufficient
+        data. `date_i` overrides "today" for testing against a past session."""
+        day = date_i or today_et()
+        warm = int((pd.Timestamp(str(day)) - pd.Timedelta(days=WARMUP_CALENDAR_DAYS)).strftime("%Y%m%d"))
+        bars = self.bt.c.stock_ohlc(ticker, warm, day)
+        if bars.empty or len(bars) < MIN_BARS:
+            return None
+        scores, bull, bear, adx, vwap = sc.compute_signals_series(bars, self.weights)
+        i = len(bars) - 1
+        sc_i = scores[i]
+        if sc_i is None or sc_i != sc_i:        # NaN-safe
+            return None
+        return {
+            "ticker": ticker, "time": bars.index[i], "spot": float(bars["Close"].iloc[i]),
+            "score": float(sc_i), "bullish": int(bull[i]), "bearish": int(bear[i]),
+            "adx": float(adx[i]) if adx[i] == adx[i] else 0.0,
+            "vwap": (float(vwap[i]) if vwap[i] == vwap[i] else None),
+        }
+
+    def entry_direction(self, st: dict) -> str | None:
+        """CALL / PUT / None for the latest bar, applying the tuned entry gates.
+        (Session window / 12:00 cutoff are enforced by the caller, not here.)"""
+        if self.adx_gate > 0 and st["adx"] < self.adx_gate:
+            return None
+        if st["score"] >= sc.BUY_THRESHOLD and st["bullish"] >= self.required:
+            return "CALL"
+        if st["score"] <= -sc.BUY_THRESHOLD and st["bearish"] >= self.required:
+            return "PUT"
+        return None
+
+    def exit_reason(self, pos: dict, st: dict, is_eod: bool) -> str | None:
+        """Mirror theta_backtest exits for an open position given the latest bid + signal.
+        `pos` carries entry premium and direction; `st` is latest() for the same ticker."""
+        bid = self.current_bid(pos["ticker"], pos["exp"], pos["strike"], pos["right"])
+        if bid is not None and pos["entry"] > 0:
+            pnl = (bid - pos["entry"]) / pos["entry"] * 100
+            if pnl >= sc.TAKE_PROFIT_PREMIUM_PCT:
+                return f"take profit (+{pnl:.0f}% prem)"
+            if pnl <= -sc.STOP_LOSS_PREMIUM_PCT:
+                return f"stop loss ({pnl:.0f}% prem)"
+        if st is not None and st["score"] is not None:
+            if pos["dir"] == "CALL" and st["score"] <= sc.SELL_THRESHOLD:
+                return "opposite signal"
+            if pos["dir"] == "PUT" and st["score"] >= sc.BUY_THRESHOLD and st["bullish"] >= self.required:
+                return "opposite signal"
+        if is_eod:
+            return "end of day"
+        return None
+
+    # ── contracts ───────────────────────────────────────────────────────────────
+    def pick_and_quote(self, ticker: str, direction: str, spot: float, t, date_i: int | None = None) -> dict | None:
+        """Pick the contract (nearest 3-14 DTE, ~2% OTM) and its current ask/bid, applying the
+        liquidity gates (premium ≥ $1, spread < 6%, OI ≥ 250). None if nothing qualifies."""
+        day = date_i or today_et()
+        pick = self.bt.pick_contract(ticker, t, spot, direction, self.moneyness)
+        if not pick:
+            return None
+        exp, strike, right, otm = pick
+        q = self.bt.c.option_quote(ticker, exp, strike, right, day, day)
+        if q.empty:
+            return None
+        last = q.iloc[-1]
+        ask, bid = float(last["ask"]), float(last["bid"])
+        if ask < self.min_premium:
+            return None
+        mid = (ask + bid) / 2
+        spread = (ask - bid) / mid * 100 if mid > 0 else 999.0
+        if spread > self.max_spread:
+            return None
+        if self.min_oi > 0 and self.bt._oi(ticker, exp, strike, right, day) < self.min_oi:
+            return None
+        iv = self.bt._iv(ticker, exp, strike, right, day)
+        return {
+            "exp": exp, "strike": strike, "right": right, "otm": otm,
+            "strike_d": strike_to_dollars(strike), "ask": ask, "bid": bid, "spread": spread,
+            "iv": iv, "exp_date": tb.exp_to_date(exp).strftime("%Y-%m-%d"),
+            "dte": (tb.exp_to_date(exp) - pd.Timestamp(str(day))).days,
+        }
+
+    def current_bid(self, ticker: str, exp: int, strike: int, right: str, date_i: int | None = None):
+        day = date_i or today_et()
+        q = self.bt.c.option_quote(ticker, exp, strike, right, day, day)
+        if q.empty:
+            return None
+        b = float(q.iloc[-1]["bid"])
+        return b if b > 0 else None
+
+
+if __name__ == "__main__":
+    # Smoke test against a recent CLOSED session (market closed today). Needs the Terminal.
+    import sys
+    day = int(sys.argv[1]) if len(sys.argv) > 1 else 20260529
+    eng = LiveEngine()
+    for tk in ["PLTR", "ORCL", "HOOD", "NVDA"]:
+        st = eng.latest(tk, date_i=day)
+        if not st:
+            print(f"{tk:5} no data"); continue
+        d = eng.entry_direction(st)
+        line = f"{tk:5} score={st['score']:+.2f} adx={st['adx']:.0f} bull={st['bullish']} bear={st['bearish']} -> {d or '—'}"
+        if d:
+            c = eng.pick_and_quote(tk, d, st["spot"], st["time"], date_i=day)
+            line += f"  | {d} ${c['strike_d']:.0f} {c['exp_date']} ask=${c['ask']:.2f} spr={c['spread']:.1f}% dte={c['dte']}" if c else "  | (no contract)"
+        print(line)

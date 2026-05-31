@@ -1,0 +1,38 @@
+name: Deploy to droplet
+
+# Push to main -> SSH into the droplet -> pull + rebuild + restart. That's the
+# "change, push, it's live" loop. Requires these repo secrets:
+#   DROPLET_HOST     - droplet IP / hostname
+#   DROPLET_USER     - ssh user (e.g. root)
+#   DROPLET_SSH_KEY  - private key authorized on the droplet
+# The droplet must have: docker, the repo cloned at ~/options-signals, a populated .env,
+# and ThetaTerminal.jar at the THETA_JAR_HOST path.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}   # allow manual redeploys from the Actions tab
+
+concurrency:
+  group: deploy-prod      # never run two deploys at once
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DROPLET_HOST }}
+          username: ${{ secrets.DROPLET_USER }}
+          key: ${{ secrets.DROPLET_SSH_KEY }}
+          command_timeout: 15m
+          script: |
+            set -e
+            cd ~/options-signals
+            git fetch origin main
+            git reset --hard origin/main
+            docker compose up -d --build
+            docker image prune -f
+            echo "deployed $(git rev-parse --short HEAD)"

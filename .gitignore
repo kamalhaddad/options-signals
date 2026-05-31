@@ -10,3 +10,8 @@ venv/
 
 # generated per-run reports / sweep artifacts
 *.log
+
+# live-bot runtime state + ThetaData binary (provided on the droplet)
+data/
+positions.json
+ThetaTerminal.jar

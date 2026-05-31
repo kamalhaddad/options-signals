@@ -1,239 +1,242 @@
+"""
+Live options-signal Discord bot — posts the TUNED strategy's entry AND exit alerts.
+
+Each scan during market hours: for every watchlist ticker it reads the latest 5-min signal
+(via `live_engine`, which mirrors `theta_backtest`), and
+  - opens a signal (posts a BUY CALL/PUT alert) when the tuned entry fires inside the entry
+    window (trade the open, no new entries after 12:00 ET), then
+  - tracks that position and posts a CLOSE alert when the strategy would exit
+    (+40% TP / -50% stop / opposite signal / end-of-day).
+Open positions persist to disk so a redeploy/restart doesn't lose them. A per-ticker cooldown
+after each close prevents flip-flop spam.
+
+Needs the ThetaData Terminal reachable (same host) + Discord creds in .env. See config.py.
+"""
 import asyncio
+import json
 import logging
-from datetime import datetime, time as dtime
+import os
+from datetime import datetime
 
 import discord
 from discord.ext import commands, tasks
 
 import config
-from signals import scan_watchlist, analyze_ticker, SignalResult
-from options import pick_option, OptionPick
+import session
+from live_engine import LiveEngine, today_et
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-log = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("bot")
+
+POSITIONS_FILE = os.getenv("POSITIONS_FILE", "positions.json")
+COOLDOWN_MIN = int(os.getenv("COOLDOWN_MINUTES", "30"))   # min minutes between re-entries per ticker
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
-def format_signal_embed(result: SignalResult, option: OptionPick | None = None) -> discord.Embed:
-    """Format a signal result with option contract recommendation."""
-    is_buy = result.signal == "BUY"
-    color = discord.Color.green() if is_buy else discord.Color.red()
-    emoji = "\U0001f7e2" if is_buy else "\U0001f534"
-    opt_type = "CALL" if is_buy else "PUT"
-
-    embed = discord.Embed(
-        title=f"{emoji} {result.signal} Signal: {result.ticker} \u2192 Buy {opt_type}",
-        color=color,
-        timestamp=datetime.now(),
-    )
-
-    embed.add_field(name="Stock Price", value=f"${result.price}", inline=True)
-    embed.add_field(name="Signal Score", value=f"{result.score:+.3f}", inline=True)
-    embed.add_field(name="Strength", value=get_strength(result.score), inline=True)
-
-    # Option contract recommendation
-    if option:
-        contract_text = (
-            f"**Contract:** `{option.contract_symbol}`\n"
-            f"**Type:** {option.option_type}\n"
-            f"**Strike:** ${option.strike:.2f} ({option.otm_pct:+.1f}% OTM)\n"
-            f"**Expiry:** {option.expiry} ({option.days_to_expiry}d)\n"
-            f"**Premium:** ${option.premium:.2f}\n"
-            f"**Bid/Ask:** ${option.bid:.2f} / ${option.ask:.2f} (spread: {option.spread_pct:.1f}%)\n"
-            f"**Delta:** ~{option.delta}\n"
-            f"**IV:** {option.implied_vol:.0f}%" if option.implied_vol else ""
-        )
-        embed.add_field(name=f"\U0001f4b0 Recommended {opt_type}", value=contract_text, inline=False)
-
-        # Targets
-        tp_pct = config.TAKE_PROFIT_PCT
-        sl_pct = config.TRAILING_STOP_PCT
-        if option.delta and option.premium > 0:
-            tp_stock = result.price * (1 + tp_pct / 100) if is_buy else result.price * (1 - tp_pct / 100)
-            sl_stock = result.price * (1 - sl_pct / 100) if is_buy else result.price * (1 + sl_pct / 100)
-            tp_option = option.premium + (result.price * tp_pct / 100 * option.delta)
-            sl_option = max(0.01, option.premium - (result.price * sl_pct / 100 * option.delta))
-
-            targets_text = (
-                f"**Take Profit:** stock ${tp_stock:.2f} \u2192 option ~${tp_option:.2f} "
-                f"(+{((tp_option - option.premium) / option.premium * 100):.0f}%)\n"
-                f"**Stop Loss:** stock ${sl_stock:.2f} \u2192 option ~${sl_option:.2f} "
-                f"({((sl_option - option.premium) / option.premium * 100):.0f}%)"
-            )
-            embed.add_field(name="\U0001f3af Targets", value=targets_text, inline=False)
-    else:
-        embed.add_field(
-            name=f"\U0001f4b0 {opt_type} Option",
-            value="No suitable contract found — low liquidity or no expiries available",
-            inline=False,
-        )
-
-    # Indicator breakdown
-    details = result.details
-    scores = details["indicator_scores"]
-    indicators_text = (
-        f"RSI: {details['rsi']:.0f} ({scores['rsi']:+.1f}) | "
-        f"MACD: {scores['macd']:+.1f} | "
-        f"EMA: {details['ema_trend']} ({scores['ema_cross']:+.1f}) | "
-        f"BB: {details['bb_position']:.0f}% ({scores['bollinger']:+.1f}) | "
-        f"StochRSI: {details['stoch_rsi']:.0f} ({scores['stoch_rsi']:+.1f}) | "
-        f"Vol: {details['volume_ratio']}x ({scores['volume']:+.1f})"
-    )
-    embed.add_field(name="Indicators", value=f"`{indicators_text}`", inline=False)
-
-    embed.set_footer(text="Not financial advice \u2022 Always manage your risk")
-
-    return embed
+# ── persistent state ────────────────────────────────────────────────────────────
+def load_state() -> dict:
+    try:
+        with open(POSITIONS_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"positions": {}, "cooldowns": {}}
 
 
-def get_strength(score: float) -> str:
-    magnitude = abs(score)
-    if magnitude >= 0.7:
-        return "\u2b50 STRONG"
-    elif magnitude >= 0.5:
-        return "\u26a1 MODERATE"
-    return "\u2022 WEAK"
+def save_state(state: dict) -> None:
+    tmp = POSITIONS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, POSITIONS_FILE)
 
 
-def is_market_hours() -> bool:
-    now = datetime.now()
-    if now.weekday() >= 5:
-        return False
-    market_open = dtime(9, 30)
-    market_close = dtime(16, 0)
-    return market_open <= now.time() <= market_close
+# ── embeds ───────────────────────────────────────────────────────────────────────
+def entry_embed(st: dict, direction: str, c: dict) -> discord.Embed:
+    is_call = direction == "CALL"
+    color = discord.Color.green() if is_call else discord.Color.red()
+    emoji = "\U0001f7e2" if is_call else "\U0001f534"
+    e = discord.Embed(title=f"{emoji} BUY {direction}: {st['ticker']} @ ${st['spot']:.2f}",
+                      color=color, timestamp=datetime.now())
+    e.add_field(name="Score", value=f"{st['score']:+.2f}", inline=True)
+    e.add_field(name="ADX", value=f"{st['adx']:.0f}", inline=True)
+    e.add_field(name="Agree", value=f"{st['bullish'] if is_call else st['bearish']}/5", inline=True)
+    e.add_field(name=f"\U0001f4b0 Contract",
+                value=(f"**${c['strike_d']:.0f} {direction}** exp {c['exp_date']} ({c['dte']}d)\n"
+                       f"Ask **${c['ask']:.2f}**  bid ${c['bid']:.2f}  (spread {c['spread']:.1f}%)\n"
+                       f"{c['otm']:+.1f}% OTM" + (f"  •  IV {c['iv']*100:.0f}%" if c.get('iv') else "")),
+                inline=False)
+    e.add_field(name="\U0001f3af Manage",
+                value=(f"Take profit **+{int(config_tp())}%** premium  •  Stop **-{int(config_sl())}%**  •  "
+                       f"exit on opposite signal / end-of-day (bot will post the close)"),
+                inline=False)
+    e.set_footer(text="Educational, not financial advice • manage your risk")
+    return e
 
 
-def analyze_with_option(ticker: str) -> tuple[SignalResult, OptionPick | None] | None:
-    """Analyze a ticker and pick an option contract if signal fires."""
-    result = analyze_ticker(ticker)
-    if result is None:
-        return None
-    option = None
-    if result.signal != "NEUTRAL":
-        option = pick_option(result.ticker, result.signal, result.price)
-    return result, option
+def exit_embed(pos: dict, reason: str, exit_bid: float | None) -> discord.Embed:
+    pnl = ((exit_bid - pos["entry"]) / pos["entry"] * 100) if (exit_bid and pos["entry"]) else None
+    win = (pnl is not None and pnl > 0)
+    emoji = "✅" if win else ("\U0001f534" if pnl is not None else "⚪")
+    color = discord.Color.green() if win else (discord.Color.red() if pnl is not None else discord.Color.greyple())
+    e = discord.Embed(title=f"{emoji} CLOSE {pos['dir']}: {pos['ticker']} ${pos['strike_d']:.0f}",
+                      color=color, timestamp=datetime.now())
+    e.add_field(name="Entry", value=f"${pos['entry']:.2f}", inline=True)
+    e.add_field(name="Exit (bid)", value=(f"${exit_bid:.2f}" if exit_bid else "n/a"), inline=True)
+    e.add_field(name="P&L", value=(f"{pnl:+.0f}%" if pnl is not None else "—"), inline=True)
+    e.add_field(name="Reason", value=reason, inline=False)
+    e.set_footer(text="Educational, not financial advice")
+    return e
 
 
-def scan_with_options() -> list[tuple[SignalResult, OptionPick | None]]:
-    """Scan watchlist and attach option picks to each signal."""
-    results = []
-    for ticker in config.WATCHLIST:
-        data = analyze_with_option(ticker)
-        if data and data[0].signal != "NEUTRAL":
-            results.append(data)
-    return results
+def config_tp():
+    import strategy_core as sc
+    return sc.TAKE_PROFIT_PREMIUM_PCT
 
 
+def config_sl():
+    import strategy_core as sc
+    return sc.STOP_LOSS_PREMIUM_PCT
+
+
+# ── core scan (sync; runs in a worker thread) ─────────────────────────────────────
+def scan() -> list[tuple[str, discord.Embed]]:
+    """One pass over the watchlist. Returns [(kind, embed)] to post; mutates persisted state.
+    A fresh engine per scan = fresh in-memory caches (today's quotes must not be cached stale)."""
+    eng = LiveEngine()
+    state = load_state()
+    positions, cooldowns = state["positions"], state["cooldowns"]
+    now = session.now_et()
+    eod = session.is_eod(now)
+    can_enter = session.in_entry_window(now)
+    out: list[tuple[str, discord.Embed]] = []
+
+    for tk in config.WATCHLIST:
+        try:
+            st = eng.latest(tk)
+        except Exception as ex:
+            log.warning(f"{tk}: latest() failed: {ex}")
+            continue
+
+        if tk in positions:
+            pos = positions[tk]
+            if st is None and not eod:
+                continue
+            reason = eng.exit_reason(pos, st, eod)
+            if reason:
+                bid = eng.current_bid(tk, pos["exp"], pos["strike"], pos["right"])
+                out.append(("exit", exit_embed(pos, reason, bid)))
+                del positions[tk]
+                cooldowns[tk] = now.timestamp() + COOLDOWN_MIN * 60
+            continue
+
+        # no open position -> consider an entry
+        if not can_enter or st is None:
+            continue
+        if cooldowns.get(tk, 0) > now.timestamp():
+            continue
+        direction = eng.entry_direction(st)
+        if not direction:
+            continue
+        c = eng.pick_and_quote(tk, direction, st["spot"], st["time"])
+        if not c:
+            continue
+        positions[tk] = {
+            "ticker": tk, "dir": direction, "exp": c["exp"], "strike": c["strike"],
+            "right": c["right"], "strike_d": c["strike_d"], "entry": c["ask"],
+            "entry_time": st["time"].strftime("%Y-%m-%d %H:%M"), "exp_date": c["exp_date"],
+            "opened": now.isoformat(),
+        }
+        out.append(("entry", entry_embed(st, direction, c)))
+
+    save_state(state)
+    return out
+
+
+# ── discord plumbing ──────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
-    log.info(f"Bot connected as {bot.user} (ID: {bot.user.id})")
-    log.info(f"Watching: {', '.join(config.WATCHLIST)}")
-    log.info(f"Scan interval: {config.SCAN_INTERVAL_MINUTES} minutes")
+    log.info(f"Connected as {bot.user} | watching {len(config.WATCHLIST)} tickers | scan {config.SCAN_INTERVAL_MINUTES}m")
     if not scanner_loop.is_running():
         scanner_loop.start()
 
 
 @tasks.loop(minutes=config.SCAN_INTERVAL_MINUTES)
 async def scanner_loop():
-    """Periodic scanner that posts signals with option recommendations."""
     channel = bot.get_channel(config.CHANNEL_ID)
-    if not channel:
+    if channel is None:
         log.error(f"Channel {config.CHANNEL_ID} not found")
         return
-
-    if not is_market_hours():
-        log.info("Market closed - skipping scan")
+    if not session.is_market_open():
+        log.info("market closed — skipping")
         return
-
-    log.info("Running watchlist scan...")
-    results = await asyncio.to_thread(scan_with_options)
-
-    if not results:
-        log.info("No actionable signals found")
-        return
-
-    log.info(f"Found {len(results)} signal(s)")
-    for result, option in results:
-        embed = format_signal_embed(result, option)
+    log.info("scanning…")
+    posts = await asyncio.to_thread(scan)
+    for kind, embed in posts:
         await channel.send(embed=embed)
         await asyncio.sleep(1)
+    log.info(f"posted {len(posts)} alert(s)")
 
 
 @scanner_loop.before_loop
-async def before_scanner():
+async def _before():
     await bot.wait_until_ready()
 
 
-@bot.command(name="scan")
-async def manual_scan(ctx):
-    """Manually trigger a watchlist scan."""
-    await ctx.send("\U0001f50d Scanning watchlist for options signals...")
-    results = await asyncio.to_thread(scan_with_options)
-
-    if not results:
-        await ctx.send("\u2705 No actionable signals right now.")
-        return
-
-    for result, option in results:
-        embed = format_signal_embed(result, option)
-        await ctx.send(embed=embed)
-
-
 @bot.command(name="check")
-async def check_ticker(ctx, ticker: str):
-    """Check a specific ticker for signals. Usage: !check AAPL"""
-    ticker = ticker.upper()
-    await ctx.send(f"\U0001f50d Analyzing **{ticker}**...")
-    data = await asyncio.to_thread(analyze_with_option, ticker)
-
-    if data is None:
-        await ctx.send(f"\u274c Could not fetch data for **{ticker}**")
+async def check(ctx, ticker: str):
+    """!check NVDA — latest signal + would-be entry for one ticker."""
+    tk = ticker.upper()
+    await ctx.send(f"\U0001f50d Analyzing **{tk}**…")
+    eng = LiveEngine()
+    st = await asyncio.to_thread(eng.latest, tk)
+    if st is None:
+        await ctx.send(f"❌ No data for **{tk}** (market closed or insufficient bars)")
         return
-
-    result, option = data
-
-    if result.signal != "NEUTRAL":
-        embed = format_signal_embed(result, option)
-        await ctx.send(embed=embed)
-    else:
-        await ctx.send(
-            f"\u26aa **{ticker}** @ ${result.price} \u2014 No signal (score: {result.score:+.3f})"
-        )
+    d = eng.entry_direction(st)
+    if d and session.in_entry_window():
+        c = await asyncio.to_thread(eng.pick_and_quote, tk, d, st["spot"], st["time"])
+        if c:
+            await ctx.send(embed=entry_embed(st, d, c)); return
+    await ctx.send(f"⚪ **{tk}** @ ${st['spot']:.2f} — score {st['score']:+.2f}, ADX {st['adx']:.0f} "
+                   f"→ {'would buy ' + d + ' but outside entry window' if d else 'no signal'}")
 
 
-@bot.command(name="watchlist")
-async def show_watchlist(ctx):
-    tickers = ", ".join(config.WATCHLIST)
-    await ctx.send(f"\U0001f4cb **Watchlist ({len(config.WATCHLIST)} tickers):** {tickers}")
+@bot.command(name="positions")
+async def positions_cmd(ctx):
+    """!positions — currently open signal positions."""
+    state = load_state()
+    pos = state["positions"]
+    if not pos:
+        await ctx.send("\U0001f4ed No open positions."); return
+    lines = [f"• **{p['ticker']}** {p['dir']} ${p['strike_d']:.0f} {p['exp_date']} @ ${p['entry']:.2f} "
+             f"(since {p['entry_time']})" for p in pos.values()]
+    await ctx.send("\U0001f4ca **Open positions:**\n" + "\n".join(lines))
 
 
 @bot.command(name="status")
-async def show_status(ctx):
-    embed = discord.Embed(title="\U0001f916 Options Signal Bot", color=discord.Color.blue())
-    embed.add_field(name="Scan Interval", value=f"{config.SCAN_INTERVAL_MINUTES} min", inline=True)
-    embed.add_field(name="Take Profit", value=f"+{config.TAKE_PROFIT_PCT}%", inline=True)
-    embed.add_field(name="Stop Loss", value=f"-{config.TRAILING_STOP_PCT}%", inline=True)
-    embed.add_field(name="Buy Threshold", value=f"{config.BUY_THRESHOLD}", inline=True)
-    embed.add_field(name="Sell Threshold", value=f"{config.SELL_THRESHOLD}", inline=True)
-    embed.add_field(name="Min Bullish", value=f"{config.MIN_BULLISH_INDICATORS}/6", inline=True)
-    embed.add_field(name="Watchlist", value=f"{len(config.WATCHLIST)} tickers", inline=True)
-    embed.add_field(name="Market Open", value="\u2705 Yes" if is_market_hours() else "\u274c No", inline=True)
-    await ctx.send(embed=embed)
+async def status_cmd(ctx):
+    import strategy_core as sc
+    e = discord.Embed(title="\U0001f916 Options Signal Bot (tuned)", color=discord.Color.blue())
+    e.add_field(name="Scan", value=f"{config.SCAN_INTERVAL_MINUTES}m", inline=True)
+    e.add_field(name="Signals", value="trend_clean + ADX>30", inline=True)
+    e.add_field(name="Entry window", value="open → 12:00 ET", inline=True)
+    e.add_field(name="Exits", value=f"+{int(sc.TAKE_PROFIT_PREMIUM_PCT)}% / -{int(sc.STOP_LOSS_PREMIUM_PCT)}% / opp / EOD", inline=True)
+    e.add_field(name="Watchlist", value=f"{len(config.WATCHLIST)}", inline=True)
+    e.add_field(name="Market", value="open" if session.is_market_open() else "closed", inline=True)
+    e.add_field(name="Open positions", value=str(len(load_state()["positions"])), inline=True)
+    await ctx.send(embed=e)
+
+
+@bot.command(name="watchlist")
+async def watchlist_cmd(ctx):
+    await ctx.send(f"\U0001f4cb **{len(config.WATCHLIST)} tickers:** {', '.join(config.WATCHLIST)}")
 
 
 if __name__ == "__main__":
     if not config.DISCORD_TOKEN:
-        log.error("DISCORD_TOKEN not set in .env file")
-        exit(1)
+        log.error("DISCORD_TOKEN not set"); raise SystemExit(1)
     if config.CHANNEL_ID == 0:
-        log.error("DISCORD_CHANNEL_ID not set in .env file")
-        exit(1)
-
+        log.error("DISCORD_CHANNEL_ID not set"); raise SystemExit(1)
     bot.run(config.DISCORD_TOKEN)

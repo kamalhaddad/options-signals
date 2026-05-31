@@ -26,7 +26,7 @@ import datetime
 import requests
 import pandas as pd
 
-BASE_URL = "http://127.0.0.1:25510"
+BASE_URL = os.getenv("THETADATA_URL", "http://127.0.0.1:25510")
 FIVE_MIN_MS = 5 * 60 * 1000
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", "thetadata")
 

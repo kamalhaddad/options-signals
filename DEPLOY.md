@@ -1,152 +1,104 @@
-# Deploying to DigitalOcean
+# Deploying the live bot (DigitalOcean droplet + push-to-deploy)
 
-## Option 1: Droplet (cheapest — $4-6/mo)
+The bot streams the tuned strategy's **entry and exit** signals to Discord during market
+hours, using **real-time ThetaData**. Because ThetaData's Terminal is IP-locked to one
+client and must run persistently, the cleanest setup is a **single droplet** running **one
+container** with both the Terminal and the bot (the bot reaches the Terminal at
+`127.0.0.1:25510`). Pushing to `main` auto-deploys via GitHub Actions.
 
-### 1. Create a Droplet
-
-- Go to https://cloud.digitalocean.com/droplets/new
-- Choose **Ubuntu 24.04**
-- Plan: **Basic → Regular → $6/mo** (1 GB RAM, 1 vCPU) — this is plenty
-- Choose a datacenter region (NYC or SFO for lowest latency to US markets)
-- Authentication: SSH key (recommended) or password
-- Click Create Droplet
-
-### 2. SSH into your Droplet
-
-```bash
-ssh root@your_droplet_ip
+```
+GitHub (push to main) ──Action──SSH──▶ Droplet ──▶ docker compose up -d --build
+                                                     └─ one container: ThetaTerminal + bot ──▶ Discord
 ```
 
-### 3. Install Docker
+## Prerequisites (one-time)
+
+1. **Discord bot** — https://discord.com/developers/applications → New Application → Bot →
+   copy the **token**; under *Privileged Gateway Intents* enable **Message Content**. Invite
+   it to your server (OAuth2 URL with `bot` scope, Send Messages permission). Right-click your
+   target channel → Copy Channel ID (enable Developer Mode first).
+2. **ThetaData** — an account **with a real-time data subscription** (historical-only will not
+   stream live signals). You have `ThetaTerminal.jar`.
+3. A **DigitalOcean droplet** — Ubuntu 24.04, Basic $6/mo (1 GB RAM), region NYC/SFO.
+
+## 1. Set up the droplet
 
 ```bash
+ssh root@YOUR_DROPLET_IP
 curl -fsSL https://get.docker.com | sh
+git clone https://github.com/kamalhaddad/options-signals.git ~/options-signals
+cd ~/options-signals
 ```
 
-### 4. Clone or upload your project
-
-If you have a git repo:
+Upload `ThetaTerminal.jar` to the droplet (from your **local** machine):
 
 ```bash
-git clone https://github.com/your-username/options-signals.git
-cd options-signals
+scp /path/to/ThetaTerminal.jar root@YOUR_DROPLET_IP:/root/ThetaTerminal.jar
 ```
 
-Or upload directly from your local machine:
+Create `.env` (copy from `.env.example`):
 
 ```bash
-# Run this from your LOCAL machine
-scp -r /path/to/options-signals root@your_droplet_ip:/root/options-signals
+cp .env.example .env && nano .env
 ```
 
-### 5. Create your .env file
-
-```bash
-cd /root/options-signals
-nano .env
 ```
-
-Add:
-
-```
-DISCORD_TOKEN=your_bot_token_here
-DISCORD_CHANNEL_ID=your_channel_id_here
+DISCORD_TOKEN=...
+DISCORD_CHANNEL_ID=...
 SCAN_INTERVAL_MINUTES=15
+COOLDOWN_MINUTES=30
+THETA_EMAIL=you@example.com
+THETA_PASSWORD=...
+THETA_JAR_HOST=/root/ThetaTerminal.jar
 ```
 
-Save with `Ctrl+X`, then `Y`, then `Enter`.
-
-### 6. Build and run
+Bring it up:
 
 ```bash
 docker compose up -d --build
+docker compose logs -f      # watch: Terminal connects, then "Connected as <bot>"
 ```
 
-### 7. Verify it's running
+The container runs the Terminal **and** the bot; `entrypoint.sh` waits for the Terminal to
+connect before starting the bot, and exits (so Docker restarts) if either process dies. Open
+positions persist in `./data/positions.json`, so restarts/redeploys don't lose them.
+
+## 2. Push-to-deploy (GitHub Actions)
+
+`.github/workflows/deploy.yml` SSHes into the droplet on every push to `main` and runs
+`git reset --hard origin/main && docker compose up -d --build`. Add these **repo secrets**
+(GitHub → Settings → Secrets and variables → Actions):
+
+| Secret | Value |
+|---|---|
+| `DROPLET_HOST` | droplet IP |
+| `DROPLET_USER` | `root` (or your ssh user) |
+| `DROPLET_SSH_KEY` | a **private** key whose public half is in the droplet's `~/.ssh/authorized_keys` |
+
+After that: **edit code → `git push` → it's live in ~1–2 min.** (`.env` and
+`ThetaTerminal.jar` stay only on the droplet — never committed.) You can also trigger a
+redeploy manually from the Actions tab (`workflow_dispatch`).
+
+> Note: a redeploy recreates the container, so the Terminal re-authenticates from the droplet's
+> (unchanged) IP — fine for the IP-lock, but expect a ~30–60s data gap. Deploy outside market
+> hours when you can.
+
+## Discord commands
+
+`!status` · `!positions` (open signals) · `!check NVDA` · `!watchlist`
+
+## Useful droplet commands
 
 ```bash
-docker compose logs -f
+docker compose ps                 # status
+docker compose logs -f            # live logs
+docker compose up -d --build      # manual redeploy
+docker compose down               # stop
+cat data/positions.json           # current open positions
 ```
 
-You should see the bot connecting to Discord. Press `Ctrl+C` to exit logs (bot keeps running).
+## Monitoring & cost
 
----
-
-## Option 2: App Platform (no server management — $5/mo)
-
-### 1. Push your code to GitHub
-
-Make sure your repo does NOT contain a `.env` file.
-
-### 2. Create an App
-
-- Go to https://cloud.digitalocean.com/apps/new
-- Select your GitHub repo
-- Component type: **Worker** (not web — this bot doesn't serve HTTP)
-- Plan: **Basic → $5/mo**
-
-### 3. Set environment variables
-
-In the App settings, add:
-
-| Key | Value |
-|-----|-------|
-| `DISCORD_TOKEN` | your bot token |
-| `DISCORD_CHANNEL_ID` | your channel ID |
-| `SCAN_INTERVAL_MINUTES` | 15 |
-
-Mark `DISCORD_TOKEN` as encrypted.
-
-### 4. Deploy
-
-Click Deploy. It will build from your Dockerfile automatically.
-
----
-
-## Useful commands (Droplet)
-
-```bash
-# Check if running
-docker compose ps
-
-# View live logs
-docker compose logs -f
-
-# Restart after code changes
-docker compose up -d --build
-
-# Stop the bot
-docker compose down
-
-# Update code from git
-git pull && docker compose up -d --build
-```
-
-## Setting up auto-updates (optional)
-
-To pull and redeploy automatically when you push to GitHub, add a cron job:
-
-```bash
-crontab -e
-```
-
-Add this line (checks every 30 minutes):
-
-```
-*/30 * * * * cd /root/options-signals && git pull && docker compose up -d --build >> /var/log/bot-deploy.log 2>&1
-```
-
-## Monitoring
-
-Set up DigitalOcean monitoring alerts (free) to get notified if your Droplet goes down:
-
-- Go to Droplet → Monitoring → Create Alert
-- Alert on CPU > 90% for 5 minutes
-- Alert on memory > 90% for 5 minutes
-
-## Costs
-
-| Option | Monthly Cost | Notes |
-|--------|-------------|-------|
-| Droplet (Basic) | $6/mo | Full control, SSH access |
-| App Platform (Worker) | $5/mo | Managed, auto-deploys from GitHub |
+- DigitalOcean → Droplet → Monitoring → alerts on CPU/memory > 90% (free).
+- Cost: **$6/mo** droplet + your ThetaData subscription. (App Platform is **not** suitable here —
+  it can't persistently mount the Terminal jar or hold the single-client IP-lock.)

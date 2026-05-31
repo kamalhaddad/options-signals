@@ -4,3 +4,9 @@ __pycache__/
 .venv/
 venv/
 .git/
+.github/
+.cache/
+data/
+*.log
+ThetaTerminal.jar
+positions.json

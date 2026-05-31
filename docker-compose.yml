@@ -3,3 +3,10 @@ services:
     build: .
     env_file: .env
     restart: unless-stopped
+    volumes:
+      # ThetaData's binary, kept on the droplet (not in the repo). Adjust the host path if needed.
+      - ${THETA_JAR_HOST:-./ThetaTerminal.jar}:/opt/ThetaTerminal.jar:ro
+      # persist open positions across redeploys/restarts
+      - ./data:/app/data
+    environment:
+      - POSITIONS_FILE=/app/data/positions.json
