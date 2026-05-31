@@ -37,13 +37,16 @@ class ThetaError(RuntimeError):
 
 class ThetaClient:
     def __init__(self, base_url: str = BASE_URL, timeout: int = 60, retries: int = 3,
-                 use_cache: bool = True, cache_dir: str = CACHE_DIR):
+                 use_cache: bool = True, cache_dir: str = CACHE_DIR, offline: bool = False):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.retries = retries
         self.s = requests.Session()
         self.use_cache = use_cache
         self.cache_dir = cache_dir
+        self.offline = offline       # serve only from disk cache; never touch the network
+        self.offline_misses = 0      # count of cache misses while offline (incomplete snapshot)
+        self._bulk_memo: dict = {}   # in-memory (root,exp,day,datatype)->parsed bulk, shared by gex+gates
         if use_cache:
             os.makedirs(cache_dir, exist_ok=True)
 
@@ -73,6 +76,11 @@ class ThetaClient:
                     return pickle.load(f)
             except Exception:
                 pass  # corrupt cache entry -> refetch
+
+        if self.offline:
+            # Terminal-free run: a miss means the snapshot doesn't cover this request.
+            self.offline_misses += 1
+            return [], []
 
         url = self.base_url + path
         fmt: list = []
@@ -177,6 +185,121 @@ class ThetaClient:
             "bid_size": df["bid_size"].astype(float), "ask_size": df["ask_size"].astype(float),
         }, index=df.index)
         out["mid"] = (out["bid"] + out["ask"]) / 2
+        return out
+
+    def bulk_hist(self, datatype: str, root: str, exp: int, date_i: int,
+                  ivl_ms: int | None = None) -> tuple[list, list]:
+        """Whole-expiration history in one call (Pro). datatype: open_interest, quote, ...
+        Returns (tick_format, contracts) where each contract is
+        {"contract": {root, expiration, strike, right}, "ticks": [[...], ...]}.
+
+        Pass ivl_ms for tick-heavy types (quote/ohlc) to avoid 570 'request too large'
+        — without it the response is tick-level for the whole chain. OI is one-per-day
+        so needs no ivl. (OI format verified live: ['ms_of_day','open_interest','date'].)
+        """
+        params = {"root": root, "exp": int(exp), "start_date": date_i, "end_date": date_i}
+        if ivl_ms is not None:
+            params["ivl"] = ivl_ms
+        return self._get(f"/v2/bulk_hist/option/{datatype}", params)
+
+    def _bulk_frames(self, fmt: list, rows: list, fields: list) -> dict:
+        """Bulk response -> {(strike_int, right): DataFrame[fields]} indexed by datetime.
+        One contract per row ({"contract": {...}, "ticks": [[...]]}). Fields absent from
+        `fmt` are skipped. Used to slice whole-expiration pulls into per-contract frames."""
+        if not fmt or not rows:
+            return {}
+        has_ts = "ms_of_day" in fmt and "date" in fmt
+        mi = fmt.index("ms_of_day") if has_ts else None
+        di = fmt.index("date") if has_ts else None
+        cols = {f: fmt.index(f) for f in fields if f in fmt}
+        out: dict = {}
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            c = item.get("contract", {})
+            ticks = item.get("ticks", [])
+            strike, right = c.get("strike"), c.get("right")
+            if strike is None or right is None or not ticks:
+                continue
+            recs, index = [], []
+            for tk in ticks:
+                try:
+                    rec = {f: float(tk[j]) for f, j in cols.items()}
+                    ts = self._to_dt(tk[di], tk[mi]) if has_ts else None
+                except (ValueError, IndexError, TypeError):
+                    continue
+                recs.append(rec)
+                index.append(ts)
+            if recs:
+                out[(int(strike), right)] = pd.DataFrame(recs, index=index if has_ts else None)
+        return out
+
+    def has_bulk(self, datatype: str, root: str, exp: int, date_i: int, ivl_ms=None) -> bool:
+        """True if this bulk pull is already in memory (e.g. fetched for the GEX profile),
+        so a consumer can reuse it for free instead of a per-contract call."""
+        return (datatype, root, int(exp), int(date_i), ivl_ms) in self._bulk_memo
+
+    def _bulk_memoized(self, datatype: str, root: str, exp: int, date_i: int, ivl_ms=None):
+        key = (datatype, root, int(exp), int(date_i), ivl_ms)
+        if key not in self._bulk_memo:
+            try:
+                self._bulk_memo[key] = self.bulk_hist(datatype, root, exp, date_i, ivl_ms=ivl_ms)
+            except ThetaError:
+                self._bulk_memo[key] = ([], [])
+        return self._bulk_memo[key]
+
+    def bulk_option_quotes(self, root: str, exp: int, date_i: int,
+                           ivl_ms: int = FIVE_MIN_MS) -> dict:
+        """Whole-expiration quotes for one day in ONE call -> {(strike_int, right): quote_df}
+        with bid/ask/sizes/mid. {} on error (caller falls back to per-contract)."""
+        fmt, rows = self._bulk_memoized("quote", root, exp, date_i, ivl_ms)
+        frames = self._bulk_frames(fmt, rows, ["bid", "ask", "bid_size", "ask_size"])
+        for df in frames.values():
+            if "bid" in df.columns and "ask" in df.columns:
+                df["mid"] = (df["bid"] + df["ask"]) / 2
+        return frames
+
+    def bulk_option_oi(self, root: str, exp: int, date_i: int) -> dict:
+        """Whole-expiration open interest for one day -> {(strike_int, right): oi_int} (last tick)."""
+        fmt, rows = self._bulk_memoized("open_interest", root, exp, date_i)
+        if not fmt or "open_interest" not in fmt:
+            return {}
+        oi_i = fmt.index("open_interest")
+        out: dict = {}
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            c, ticks = item.get("contract", {}), item.get("ticks", [])
+            if c.get("strike") is None or c.get("right") is None or not ticks:
+                continue
+            try:
+                out[(int(c["strike"]), c["right"])] = int(ticks[-1][oi_i])
+            except (ValueError, IndexError, TypeError):
+                continue
+        return out
+
+    def bulk_option_iv(self, root: str, exp: int, date_i: int, ivl_ms: int = FIVE_MIN_MS) -> dict:
+        """Whole-expiration greeks for one day -> {(strike_int, right): first_positive_iv}.
+        {} if the bulk greeks endpoint isn't available (caller falls back)."""
+        fmt, rows = self._bulk_memoized("greeks", root, exp, date_i, ivl_ms)
+        if not fmt or "implied_vol" not in fmt:
+            return {}
+        iv_i = fmt.index("implied_vol")
+        out: dict = {}
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            c, ticks = item.get("contract", {}), item.get("ticks", [])
+            if c.get("strike") is None or c.get("right") is None or not ticks:
+                continue
+            for tk in ticks:
+                try:
+                    v = float(tk[iv_i])
+                except (ValueError, IndexError, TypeError):
+                    continue
+                if v > 0:
+                    out[(int(c["strike"]), c["right"])] = v
+                    break
         return out
 
     def option_oi(self, root: str, exp: int, strike: int, right: str, date_i: int) -> int:

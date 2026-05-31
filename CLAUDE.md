@@ -14,6 +14,10 @@ options-signals/
 ├── strategy_core.py  # Self-contained, parity-verified copy of the signal engine (shared)
 ├── thetadata_client.py # REST client for the local ThetaData Terminal (stock/option/greeks)
 ├── theta_backtest.py # Best-in-class backtest on REAL ThetaData option prices (see below)
+├── tune.py           # Anti-overfit sweep harness — runs each config across 24h/72h/month at once
+├── snapshot.py       # Warm the cache for a window so backtests run --offline (Terminal-free)
+├── gex.py            # Dealer-gamma (GEX) signals — opt-in via --gex-* flags, OFF by default (rejected)
+├── gex_sweep.py      # GEX gate sweep + live bulk-parse verify (--verify)
 ├── STRATEGY.md       # ⭐ Tuned strategy, winning config (= defaults), findings & honest perf — READ FIRST
 ├── test_parity.py    # Verifies strategy_core matches the original engine exactly
 ├── config.py         # All tunable parameters (thresholds, weights, watchlist, indicator periods)
@@ -117,8 +121,12 @@ All parameters are in `config.py`:
 | `MIN_BULLISH_INDICATORS` | 4 | Higher = more indicators must agree |
 | `TAKE_PROFIT_PCT` | 2.5 | Higher = let winners run more |
 | `TRAILING_STOP_PCT` | 2.0 | Higher = more room before stop-out |
-| `SKIP_OPEN_MINUTES` | 20 | Skip volatile open |
+| `SKIP_OPEN_MINUTES` | 0 | 0 = trade the open (strong open-momentum trends) |
 | `SKIP_CLOSE_MINUTES` | 15 | Skip volatile close |
+| `ENTRY_CUTOFF` | "12:00" | No new entries after noon ET — morning-session-only edge (biggest recent win) |
+
+**Offline/fast tuning:** the bottleneck is ThetaData REST calls, not compute. Warm the cache once
+(`snapshot.py` or one online run), then sweep with `theta_backtest.py ... --offline` (Terminal-free, ~10× faster).
 
 Indicator periods (RSI_PERIOD, MACD_FAST/SLOW/SIGNAL, etc.) are tuned for fast intraday signals. Standard periods work better for swing trading.
 

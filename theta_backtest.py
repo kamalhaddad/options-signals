@@ -27,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 
 import strategy_core as sc
+import gex as gexmod
 from thetadata_client import ThetaClient, strike_to_dollars
 
 # Contract-selection / cost constants (mirror options.pick_option intent).
@@ -42,6 +43,11 @@ MIN_OPEN_INTEREST = 250    # liquidity floor
 COMMISSION_PER_CONTRACT = 0.65
 WARMUP_BARS = 40            # 5-min bars before signals are trusted
 WARMUP_CALENDAR_DAYS = 4    # ~2 trading days back (>=150 bars) — plenty past ADX/vol-avg settle
+
+# Intraday-GEX knobs (all per-ticker; see gex.py).
+GEX_SIZE_MAX_MULT = 2.0    # conviction sizing: up to 2x risk when fully short-gamma
+WALL_STRIKE_FRAC = 0.6     # long strike sits this far from spot toward the gamma wall
+WALL_MIN_ROOM_PCT = 0.3    # skip entries when the wall is closer than this (no profit room)
 
 # Signal presets for ablation/tuning. Weights are renormalized in strategy_core,
 # so only relative magnitudes matter. Keys: rsi, macd, ema_cross, bollinger,
@@ -95,13 +101,16 @@ def compute_market_regime(index_bars: pd.DataFrame) -> dict:
 
 
 class ThetaBacktest:
-    def __init__(self, client: ThetaClient):
+    def __init__(self, client: ThetaClient, use_bulk: bool = True):
         self.c = client
+        self.use_bulk = use_bulk                       # bulk per-(root,exp,day) pulls vs per-contract
         self._exp_cache: dict[str, list[int]] = {}
         self._strike_cache: dict[tuple, list[int]] = {}
         self._optq_cache: dict[tuple, pd.DataFrame] = {}
         self._iv_cache: dict[tuple, float] = {}
         self._oi_cache: dict[tuple, int] = {}
+        self._gexprof_cache: dict[tuple, list] = {}    # (root, day) -> static gamma profile
+        self._bulkoi_cache: dict[tuple, dict] = {}     # (root, exp, day) -> {(strike,right): oi} (GEX-shared)
 
     # ── chain helpers (cached) ────────────────────────────────────────────────
     def expirations(self, root: str) -> list[int]:
@@ -116,6 +125,9 @@ class ThetaBacktest:
         return self._strike_cache[key]
 
     def option_quotes(self, root: str, exp: int, strike: int, right: str, date_i: int) -> pd.DataFrame:
+        # Per-contract: the backtest needs ~1 contract per exp-day, so whole-chain bulk
+        # quotes are a big net loss here (measured ~25x slower). Bulk is for the GEX
+        # profile (whole chain), not trade execution.
         key = (root, exp, strike, right, date_i)
         if key not in self._optq_cache:
             self._optq_cache[key] = self.c.option_quote(root, exp, strike, right, date_i, date_i)
@@ -153,7 +165,10 @@ class ThetaBacktest:
                    weights=None, required=None, adx_gate=0.0,
                    moneyness=OTM_TARGET_PCT, vwap_gate=False, trail=0.0, iv_max=MAX_IV,
                    risk=0.0, slippage=0.0, market_regime=None,
-                   max_spread=MAX_SPREAD_PCT, min_premium=MIN_PREMIUM, min_oi=0) -> list[dict]:
+                   max_spread=MAX_SPREAD_PCT, min_premium=MIN_PREMIUM, min_oi=0,
+                   entry_cutoff_min=None, gex_by_day=None, gex_threshold=None,
+                   gex_intraday=None, gex_size=False, gex_walls=False, gex_wall_tp=True,
+                   gex_max_dte=14) -> list[dict]:
         warm_start = int((pd.Timestamp(str(start)) - pd.Timedelta(days=WARMUP_CALENDAR_DAYS)).strftime("%Y%m%d"))
         bars = self.c.stock_ohlc(root, warm_start, end)
         if bars.empty:
@@ -168,7 +183,13 @@ class ThetaBacktest:
         if required is None:
             required = sc.MIN_BULLISH_INDICATORS
         closes = bars["Close"].to_numpy(dtype=float)
+        opens = bars["Open"].to_numpy(dtype=float)
         idx = list(bars.index)
+        ticker_gex_on = gex_size or gex_walls
+        day_open: dict[int, float] = {}
+        if ticker_gex_on:
+            for i, t in enumerate(idx):
+                day_open.setdefault(int(t.strftime("%Y%m%d")), float(opens[i]))
         for i, t in enumerate(idx):
             spot = float(closes[i])
             is_last_of_day = (i == len(idx) - 1) or (idx[i + 1].normalize() != t.normalize())
@@ -193,6 +214,10 @@ class ThetaBacktest:
                             exit_reason = f"trailing stop ({pnl:.0f}% prem)"
                     elif pnl <= -sc.STOP_LOSS_PREMIUM_PCT:
                         exit_reason = f"stop loss ({pnl:.0f}% prem)"
+                if exit_reason is None and pos.get("target_level") is not None:
+                    tl = pos["target_level"]
+                    if (pos["dir"] == "CALL" and spot >= tl) or (pos["dir"] == "PUT" and spot <= tl):
+                        exit_reason = "gamma wall"
                 if exit_reason is None and score is not None:
                     if pos["dir"] == "CALL" and score <= sc.SELL_THRESHOLD:
                         exit_reason = "opposite signal"
@@ -209,7 +234,18 @@ class ThetaBacktest:
                     continue
 
             # ── entries ───────────────────────────────────────────────────────
-            if not in_trade and in_request_window and score is not None and self._within_window(t) and not is_last_of_day:
+            before_cutoff = entry_cutoff_min is None or (t.hour * 60 + t.minute) <= entry_cutoff_min
+            # timing gate: SPY regime. Per-bar (intraday flip) preferred over day-level.
+            if gex_threshold is None:
+                gex_ok = True
+            elif gex_intraday is not None:
+                gex_ok = gex_intraday.get(t.strftime("%Y%m%d%H%M"), 1e18) <= gex_threshold
+            elif gex_by_day is not None:
+                gex_ok = gex_by_day.get(int(t.strftime("%Y%m%d")), 1e18) <= gex_threshold
+            else:
+                gex_ok = True
+            if (not in_trade and in_request_window and score is not None and self._within_window(t)
+                    and not is_last_of_day and before_cutoff and gex_ok):
                 adx_ok = adx_gate <= 0 or (adx_vals[i] == adx_vals[i] and adx_vals[i] >= adx_gate)
                 vw = vwap_vals[i]
                 above_vwap = (vw == vw) and spot > vw   # NaN-safe
@@ -223,10 +259,35 @@ class ThetaBacktest:
                     direction = "CALL"
                 elif adx_ok and mkt_put and score <= -sc.BUY_THRESHOLD and bearish >= required and (not vwap_gate or below_vwap):
                     direction = "PUT"
+                # ── per-ticker GEX: conviction sizing + gamma-wall strike/TP ──────
+                eff_moneyness, eff_risk, target_level = moneyness, risk, None
+                if direction and ticker_gex_on:
+                    day_i = int(t.strftime("%Y%m%d"))
+                    prof = self._ticker_profile(root, day_i, day_open.get(day_i, spot), gex_max_dte)
+                    if prof:
+                        if gex_size and risk > 0:
+                            net = gexmod.net_gex_at(prof, spot)
+                            gross = gexmod.gross_gex_at(prof, spot)
+                            conv = min(1.0, max(0.0, -net / gross)) if gross > 0 else 0.0  # 0=balanced..1=fully short
+                            eff_risk = risk * (1 + conv * (GEX_SIZE_MAX_MULT - 1))
+                        if gex_walls:
+                            call_wall, put_wall = gexmod.gamma_walls(prof, day_open.get(day_i, spot))
+                            wall = call_wall if direction == "CALL" else put_wall
+                            if wall is not None:
+                                room_pct = ((wall / spot - 1) if direction == "CALL"
+                                            else (1 - wall / spot)) * 100
+                                if room_pct < WALL_MIN_ROOM_PCT:
+                                    direction = None   # wall on top of spot: pinned, no room
+                                else:
+                                    # long strike sits partway to the wall; TP = the wall level
+                                    eff_moneyness = min(moneyness, room_pct * WALL_STRIKE_FRAC)
+                                    if gex_wall_tp:
+                                        target_level = wall
                 if direction:
-                    opened = self._try_open(root, t, spot, direction, score, i, moneyness, iv_max, risk, slippage,
-                                            max_spread, min_premium, min_oi)
+                    opened = self._try_open(root, t, spot, direction, score, i, eff_moneyness, iv_max, eff_risk,
+                                            slippage, max_spread, min_premium, min_oi)
                     if opened:
+                        opened["target_level"] = target_level
                         pos = opened
                         in_trade = True
         return trades
@@ -300,11 +361,34 @@ class ThetaBacktest:
             "score": round(score, 3), "quotes": quotes,
         }
 
+    def _ticker_profile(self, root, day, ref_spot, max_dte):
+        """The ticker's own static gamma profile for `day` (cached). [] on any data error
+        so a thin/failed chain just disables the per-ticker GEX logic for that day."""
+        key = (root, day)
+        if key not in self._gexprof_cache:
+            try:
+                self._gexprof_cache[key] = gexmod.build_day_profile(
+                    self.c, day, ref_spot, root=root, max_dte=max_dte)
+            except Exception:
+                self._gexprof_cache[key] = []
+        return self._gexprof_cache[key]
+
     def _oi(self, root, exp, strike, right, date_i):
         key = (root, exp, strike, right, date_i)
-        if key not in self._oi_cache:
-            self._oi_cache[key] = self.c.option_oi(root, exp, strike, right, date_i)
-        return self._oi_cache[key]
+        if key in self._oi_cache:
+            return self._oi_cache[key]
+        val = None
+        # Reuse the GEX profile's bulk OI ONLY if it's already in memory (free); never
+        # trigger a whole-chain pull just for one contract's OI.
+        if self.use_bulk and self.c.has_bulk("open_interest", root, exp, date_i):
+            bkey = (root, exp, date_i)
+            if bkey not in self._bulkoi_cache:
+                self._bulkoi_cache[bkey] = self.c.bulk_option_oi(root, exp, date_i)
+            val = self._bulkoi_cache[bkey].get((strike, right), 0)
+        if val is None:
+            val = self.c.option_oi(root, exp, strike, right, date_i)
+        self._oi_cache[key] = val
+        return val
 
     def _iv(self, root, exp, strike, right, date_i):
         key = (root, exp, strike, right, date_i)
@@ -359,10 +443,28 @@ def main():
     ap.add_argument("--max-spread", type=float, default=MAX_SPREAD_PCT, help="max bid/ask spread %% (tighter=better fills)")
     ap.add_argument("--min-premium", type=float, default=MIN_PREMIUM, help="min option premium $")
     ap.add_argument("--min-oi", type=int, default=MIN_OPEN_INTEREST, help="min open interest (0=off)")
+    ap.add_argument("--skip-open", type=int, default=0, help="minutes to skip after open (default 0 = trade the open)")
+    ap.add_argument("--skip-close", type=int, default=sc.SKIP_CLOSE_MINUTES, help="minutes to skip before close")
+    ap.add_argument("--entry-cutoff", default="12:00", help="no new entries after this HH:MM (default 12:00 = morning-session-only edge; '' = off)")
+    ap.add_argument("--gex-gate", type=float, default=None, help="only trade days where SPY GEX <= this (e.g. 0 = trending regimes)")
+    ap.add_argument("--gex-flip", action="store_true", help="per-BAR SPY timing gate: enter only when intraday SPY GEX <= threshold (short-gamma/trend); threshold from --gex-gate or 0")
+    ap.add_argument("--gex-size", action="store_true", help="conviction sizing: scale risk up to 2x by the TICKER's own short-gamma depth (needs --risk)")
+    ap.add_argument("--gex-walls", action="store_true", help="strike + TP from the TICKER's gamma walls (long strike below the wall, take profit at it)")
+    ap.add_argument("--no-wall-tp", action="store_true", help="with --gex-walls: use walls for STRIKE only, not the take-profit (don't cap winners at the wall)")
+    ap.add_argument("--gex-max-dte", type=int, default=14, help="GEX expiry window in days (default 14)")
+    ap.add_argument("--offline", action="store_true", help="serve only from the local cache/snapshot; no Terminal needed")
+    ap.add_argument("--no-bulk", action="store_true", help="per-contract pulls instead of bulk-per-exp-day (slower; for parity/debug)")
     args = ap.parse_args()
+    sc.SKIP_OPEN_MINUTES = args.skip_open
+    sc.SKIP_CLOSE_MINUTES = args.skip_close
+    entry_cutoff_min = None
+    if args.entry_cutoff:
+        hh, mm = args.entry_cutoff.split(":")
+        entry_cutoff_min = int(hh) * 60 + int(mm)
     sc.STOP_LOSS_PREMIUM_PCT = args.stop
     sc.TAKE_PROFIT_PREMIUM_PCT = args.tp
     sc.BUY_THRESHOLD = args.buy_threshold
+    mk_client = lambda: ThetaClient(offline=args.offline)
 
     weights = SIGNAL_PRESETS[args.signals]
     n_active = sum(1 for w in weights.values() if w > 0)
@@ -378,7 +480,7 @@ def main():
     market_regime = None
     if args.market_gate:
         ws = int((pd.Timestamp(str(start)) - pd.Timedelta(days=WARMUP_CALENDAR_DAYS)).strftime("%Y%m%d"))
-        spy = ThetaClient().stock_ohlc(MARKET_INDEX, ws, end)
+        spy = mk_client().stock_ohlc(MARKET_INDEX, ws, end)
         market_regime = compute_market_regime(spy)
         b = sum(1 for v in market_regime.values() if v > 0)
         s_ = sum(1 for v in market_regime.values() if v < 0)
@@ -391,6 +493,34 @@ def main():
         print(s)
         report.append(s)
 
+    # ── SPY timing gate (per-day --gex-gate OR per-bar --gex-flip) ────────────
+    gex_by_day = gex_intraday = None
+    gex_threshold = args.gex_gate
+    if args.gex_flip:
+        if gex_threshold is None:
+            gex_threshold = 0.0   # short-gamma side by default
+        gc = mk_client()
+        spy_bars = gc.stock_ohlc(MARKET_INDEX, start, end)
+        gex_intraday, day_ctx = gexmod.spy_gex_intraday(gc, spy_bars, max_dte=args.gex_max_dte)
+        bars_on = sum(1 for v in gex_intraday.values() if v <= gex_threshold)
+        emit(f"  gex-flip ON (per-bar SPY GEX <= {gex_threshold/1e9:.1f}B): "
+             f"{bars_on}/{len(gex_intraday)} bars tradable | flip levels: "
+             + " ".join(f"{d%10000:04d}:{(c['flip'] if c['flip']==c['flip'] and abs(c['flip'])!=float('inf') else 0):.0f}"
+                        for d, c in sorted(day_ctx.items())))
+    elif args.gex_gate is not None:
+        gc = mk_client()
+        spy_bars = gc.stock_ohlc(MARKET_INDEX, start, end)   # 5-min; first open per day = spot
+        day_to_spot = {}
+        for ts, row in spy_bars.iterrows():
+            day_to_spot.setdefault(int(ts.strftime("%Y%m%d")), float(row["Open"]))
+        gex_by_day = gexmod.spy_gex_by_day(gc, day_to_spot, max_dte=args.gex_max_dte)
+        tradable = sum(1 for v in gex_by_day.values() if v <= args.gex_gate)
+        emit(f"  gex-gate ON (SPY GEX <= {args.gex_gate/1e9:.1f}B): {tradable}/{len(gex_by_day)} days tradable | "
+             + " ".join(f"{d%10000:04d}:{v/1e9:+.1f}B" for d, v in sorted(gex_by_day.items())))
+    if args.gex_size or args.gex_walls:
+        emit(f"  per-ticker GEX: size={'on' if args.gex_size else 'off'} "
+             f"walls={'on' if args.gex_walls else 'off'} (max_dte={args.gex_max_dte})")
+
     all_trades: list[dict] = []
     emit(f"{'='*118}")
     emit(f"  REAL-OPTIONS BACKTEST (ThetaData)  {args.start} -> {args.end}  ({len(tickers)} tickers, {args.workers} workers)")
@@ -402,11 +532,14 @@ def main():
 
     def run_one(tk):
         # Each ticker gets its own client/caches (thread-safe isolation).
-        return tk, ThetaBacktest(ThetaClient()).run_ticker(
+        return tk, ThetaBacktest(mk_client(), use_bulk=not args.no_bulk).run_ticker(
             tk, start, end, weights=weights, required=required, adx_gate=args.adx_gate,
             moneyness=args.moneyness, vwap_gate=args.vwap_gate, trail=args.trail, iv_max=args.iv_max,
             risk=args.risk, slippage=args.slippage, market_regime=market_regime,
-            max_spread=args.max_spread, min_premium=args.min_premium, min_oi=args.min_oi)
+            max_spread=args.max_spread, min_premium=args.min_premium, min_oi=args.min_oi,
+            entry_cutoff_min=entry_cutoff_min, gex_by_day=gex_by_day, gex_threshold=gex_threshold,
+            gex_intraday=gex_intraday, gex_size=args.gex_size, gex_walls=args.gex_walls,
+            gex_wall_tp=not args.no_wall_tp, gex_max_dte=args.gex_max_dte)
 
     done = 0
     with ThreadPoolExecutor(max_workers=args.workers) as ex:

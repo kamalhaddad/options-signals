@@ -67,9 +67,12 @@ MIN_BULLISH_INDICATORS = 4  # Need 4/6 indicators agreeing
 TRAILING_STOP_PCT = 2.0
 TAKE_PROFIT_PCT = 2.5
 
-# Skip first/last N minutes (open and close are noisy)
-SKIP_OPEN_MINUTES = 20
+# Session window — "morning-session-only" edge (validated on 215-trade month + 24h/72h):
+# trade the open, but take NO new entries after 12:00 ET. Afternoon entries (chop,
+# reversals, theta into the close) bleed; cutting them lifts win rate AND total return.
+SKIP_OPEN_MINUTES = 0          # 0 = trade the open (the strong open-momentum trends)
 SKIP_CLOSE_MINUTES = 15
+ENTRY_CUTOFF = "12:00"         # no new entries after this (ET); "" = off
 
 # Technical indicator weights (must sum to 1.0) — 6 indicators
 WEIGHTS = {

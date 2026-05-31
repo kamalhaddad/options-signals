@@ -8,5 +8,5 @@ venv/
 # ThetaData response cache
 .cache/
 
-# generated per-run report
-backtest.log
+# generated per-run reports / sweep artifacts
+*.log
