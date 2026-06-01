@@ -68,7 +68,7 @@ class ThetaClient:
     # ── low-level ─────────────────────────────────────────────────────────────
     def _get(self, path: str, params: dict) -> tuple[list, list]:
         """Return (format, rows). Follows pagination. 472 -> empty. Disk-cached."""
-        cache_ok = self.use_cache and self._cacheable(params)
+        cache_ok = self.use_cache and self._cacheable(params) and "/snapshot/" not in path  # snapshots are real-time
         cpath = self._cache_path(path, params) if cache_ok else None
         if cache_ok and os.path.exists(cpath):
             try:
@@ -171,6 +171,19 @@ class ThetaClient:
             "Volume": df["volume"].astype(float),
         }, index=df.index)
         return out[(out["Close"] > 0)]
+
+    def stock_snapshot(self, root: str) -> dict | None:
+        """Real-time stock OHLC snapshot (whole-day OHLC with a LIVE close). Used to splice a
+        current bar onto the ~15-min-lagged hist OHLC. Returns {open,high,low,close,volume,date}
+        or None. NOT cached (real-time)."""
+        fmt, rows = self._get("/v2/snapshot/stock/ohlc", {"root": root})
+        if not rows:
+            return None
+        row = rows[-1]
+        try:
+            return {k: row[fmt.index(k)] for k in ("open", "high", "low", "close", "volume", "date")}
+        except (ValueError, IndexError):
+            return None
 
     def option_quote(self, root: str, exp: int, strike: int, right: str,
                      start: int, end: int, ivl_ms: int = FIVE_MIN_MS) -> pd.DataFrame:

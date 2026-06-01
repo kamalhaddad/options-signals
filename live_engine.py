@@ -16,6 +16,8 @@ import math
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import os
+
 import pandas as pd
 
 import strategy_core as sc
@@ -25,6 +27,8 @@ from thetadata_client import ThetaClient, strike_to_dollars
 ET = ZoneInfo("America/New_York")
 WARMUP_CALENDAR_DAYS = tb.WARMUP_CALENDAR_DAYS
 MIN_BARS = 40
+# Hist OHLC lags ~15min intraday even on PRO; splice the real-time snapshot as the current bar.
+USE_SNAPSHOT = os.getenv("LIVE_SNAPSHOT", "1") != "0"
 
 
 def today_et() -> int:
@@ -58,6 +62,20 @@ class LiveEngine:
         bars = self.bt.c.stock_ohlc(ticker, warm, day)
         if bars.empty or len(bars) < MIN_BARS:
             return None
+        # Splice the real-time snapshot as the current bar (live only; backtests pass date_i).
+        # Captures the move since the last (lagged) hist bar with a sane single-bar range.
+        if USE_SNAPSHOT and date_i is None:
+            snap = self.bt.c.stock_snapshot(ticker)
+            if snap and float(snap.get("close") or 0) > 0 and int(snap.get("date") or 0) == day:
+                cur = float(snap["close"])
+                last_close = float(bars["Close"].iloc[-1])
+                cur_t = pd.Timestamp(datetime.now(ET).replace(tzinfo=None)).floor("5min")
+                if cur_t <= bars.index[-1]:
+                    cur_t = bars.index[-1] + pd.Timedelta(minutes=5)
+                bars = pd.concat([bars, pd.DataFrame([{
+                    "Open": last_close, "High": max(last_close, cur), "Low": min(last_close, cur),
+                    "Close": cur, "Volume": float(bars["Volume"].iloc[-1]),
+                }], index=[cur_t])])
         scores, bull, bear, adx, vwap = sc.compute_signals_series(bars, self.weights)
         i = len(bars) - 1
         sc_i = scores[i]
