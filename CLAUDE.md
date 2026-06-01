@@ -18,6 +18,9 @@ options-signals/
 ├── snapshot.py       # Warm the cache for a window so backtests run --offline (Terminal-free)
 ├── gex.py            # Dealer-gamma (GEX) signals — opt-in via --gex-* flags, OFF by default (rejected)
 ├── gex_sweep.py      # GEX gate sweep + live bulk-parse verify (--verify)
+├── rs_research.py    # Relative-strength sweep (3-window, anti-overfit) — RS is LIVE
+├── vol_research.py   # IV-rank (vol-surface) research — post-filters a trade dump by IV rank
+├── SIGNALS.md        # ⭐ Tier-1 signal research status: RS (live), IV-rank (banked), GEX (rejected)
 ├── STRATEGY.md       # ⭐ Tuned strategy, winning config (= defaults), findings & honest perf — READ FIRST
 ├── test_parity.py    # Verifies strategy_core matches the original engine exactly
 ├── config.py         # All tunable parameters (thresholds, weights, watchlist, indicator periods)

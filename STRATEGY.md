@@ -38,6 +38,10 @@ Run it (ThetaData Terminal must be running — see `lean/`… no, see below):
 ## What we learned (don't re-discover these the hard way)
 
 **What WORKED:**
+- **Cross-sectional relative strength (top-50% leaders).** First fund-caliber "Tier-1" signal
+  to pass — a free lunch (win rate, expectancy, AND total up). **Now live in the bot.** IV-rank
+  (vol surface) also passes but is a quality/volume tradeoff — researched & banked, not live.
+  Full status + numbers in **[[SIGNALS.md]]**.
 - **Morning-session-only (trade the open + no new entries after 12:00 ET).** The single
   biggest win since the original tuning. Validated on the **215-trade month** (not just the
   recent windows), it lifts *both* metrics at once because the two halves are synergistic:
