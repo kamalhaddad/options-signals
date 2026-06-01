@@ -251,6 +251,64 @@ def weekly_collect():
     return week_label, db.closed_between(monday, friday)
 
 
+def rank_candidates(limit: int = 10):
+    """Top tickers by |score| right now, each tagged with which gate it clears/fails — the
+    same decision logic scan() uses. Returns (list[dict], now). Heavy (one latest() per
+    ticker); run in a worker thread."""
+    eng = LiveEngine()
+    now = session.now_et()
+    can_enter = session.in_entry_window(now)
+    states = {}
+    for tk in config.WATCHLIST:
+        try:
+            states[tk] = eng.latest(tk)
+        except Exception:
+            states[tk] = None
+    valid = {tk: s for tk, s in states.items() if s is not None}
+
+    leaders = None
+    if 0 < RS_QUANTILE < 1:
+        ranked = sorted(((s["ret_open"], tk) for tk, s in valid.items() if s.get("ret_open") is not None),
+                        reverse=True)
+        leaders = {tk for _, tk in ranked[:max(1, int(len(ranked) * RS_QUANTILE))]}
+
+    out = []
+    req = eng.required
+    for tk, st in sorted(valid.items(), key=lambda kv: abs(kv[1]["score"]), reverse=True)[:limit]:
+        score, adx = st["score"], st["adx"]
+        is_call, is_put = score >= sc.BUY_THRESHOLD, score <= -sc.BUY_THRESHOLD
+        d = "CALL" if is_call else ("PUT" if is_put else "—")
+        leader = leaders is None or tk in leaders
+        if not (is_call or is_put):
+            status = f"no signal (|{score:+.2f}|<{sc.BUY_THRESHOLD})"
+        elif eng.adx_gate > 0 and adx < eng.adx_gate:
+            status = f"ADX {adx:.0f}<{int(eng.adx_gate)}"
+        elif (is_call and st["bullish"] < req) or (is_put and st["bearish"] < req):
+            status = f"breadth {(st['bullish'] if is_call else st['bearish'])}/{req}"
+        elif not can_enter:
+            status = "outside window"
+        elif not leader:
+            status = "RS laggard"
+        else:
+            lc = db.last_close_time(tk)
+            status = "cooldown" if (lc is not None and (now - lc).total_seconds() < COOLDOWN_MIN * 60) else "✅ tradeable"
+        out.append({"ticker": tk, "score": score, "adx": adx, "ret": st["ret_open"] * 100,
+                    "leader": leader, "dir": d, "status": status})
+    return out, now
+
+
+def candidates_embed(cands: list, now) -> discord.Embed:
+    e = discord.Embed(title=f"\U0001f50e Top candidates — {now.strftime('%H:%M ET')}", color=discord.Color.blue())
+    lines = []
+    for c in cands:
+        mark = "✅" if c["status"].startswith("✅") else "•"
+        lines.append(f"{mark} **{c['ticker']}** {c['score']:+.2f} · ADX {c['adx']:.0f} · "
+                     f"RS{'✓' if c['leader'] else '✗'} · {c['ret']:+.1f}% → {c['dir']} ({c['status']})")
+    e.description = "\n".join(lines) or "no data"
+    e.set_footer(text="entry needs score≥0.46 + 4/5 breadth + ADX>30 + RS-leader + liquid contract")
+    return e
+
+
 # ── discord plumbing ──────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
@@ -351,6 +409,14 @@ async def weeksummary_cmd(ctx):
     """!weeksummary — this week's closed trades so far."""
     label, monday, friday = _week_bounds(session.now_et())
     await ctx.send(embed=weekly_summary_embed(label, await asyncio.to_thread(db.closed_between, monday, friday)))
+
+
+@bot.command(name="top")
+async def top_cmd(ctx, n: int = 10):
+    """!top [n] — the bot's current top candidates and why each is/isn't tradeable."""
+    await ctx.send("\U0001f50e Ranking candidates… (~40s)")
+    cands, now = await asyncio.to_thread(rank_candidates, max(1, min(n, 20)))
+    await ctx.send(embed=candidates_embed(cands, now))
 
 
 @bot.command(name="stats")
