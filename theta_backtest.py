@@ -168,7 +168,7 @@ class ThetaBacktest:
                    max_spread=MAX_SPREAD_PCT, min_premium=MIN_PREMIUM, min_oi=0,
                    entry_cutoff_min=None, gex_by_day=None, gex_threshold=None,
                    gex_intraday=None, gex_size=False, gex_walls=False, gex_wall_tp=True,
-                   gex_max_dte=14) -> list[dict]:
+                   gex_max_dte=14, rs_bars=None) -> list[dict]:
         warm_start = int((pd.Timestamp(str(start)) - pd.Timedelta(days=WARMUP_CALENDAR_DAYS)).strftime("%Y%m%d"))
         bars = self.c.stock_ohlc(root, warm_start, end)
         if bars.empty:
@@ -244,8 +244,11 @@ class ThetaBacktest:
                 gex_ok = gex_by_day.get(int(t.strftime("%Y%m%d")), 1e18) <= gex_threshold
             else:
                 gex_ok = True
+            # cross-sectional relative-strength gate: only enter when this ticker is a
+            # leader at this bar (rs_bars = set of allowed "YYYYMMDDHHMM" for this ticker).
+            rs_ok = rs_bars is None or t.strftime("%Y%m%d%H%M") in rs_bars
             if (not in_trade and in_request_window and score is not None and self._within_window(t)
-                    and not is_last_of_day and before_cutoff and gex_ok):
+                    and not is_last_of_day and before_cutoff and gex_ok and rs_ok):
                 adx_ok = adx_gate <= 0 or (adx_vals[i] == adx_vals[i] and adx_vals[i] >= adx_gate)
                 vw = vwap_vals[i]
                 above_vwap = (vw == vw) and spot > vw   # NaN-safe
@@ -418,6 +421,30 @@ class ThetaBacktest:
         }
 
 
+def rs_leader_sets(client, tickers, start, end, quantile):
+    """Cross-sectional relative strength: {ticker: set('YYYYMMDDHHMM' where it's a top-`quantile`
+    leader by intraday return-since-open)}. Uses only stock bars (no look-ahead: bar-t closes)."""
+    rets = {}
+    for tk in tickers:
+        b = client.stock_ohlc(tk, start, end)
+        if b.empty:
+            continue
+        day = b.index.strftime("%Y%m%d")
+        day_open = b["Open"].groupby(day).transform("first")
+        ret = (b["Close"] - day_open) / day_open
+        for ts, r in ret.items():
+            if r == r:
+                rets.setdefault(ts.strftime("%Y%m%d%H%M"), {})[tk] = float(r)
+    leaders = {tk: set() for tk in tickers}
+    for ts_str, d in rets.items():
+        if len(d) < 5:
+            continue
+        ranked = sorted(d.items(), key=lambda x: -x[1])
+        for tk, _ in ranked[:max(1, int(len(ranked) * quantile))]:
+            leaders[tk].add(ts_str)
+    return leaders
+
+
 def main():
     ap = argparse.ArgumentParser(description="Real-options backtest on ThetaData")
     ap.add_argument("--tickers", default="NVDA", help="comma-separated, or 'all' for the watchlist")
@@ -454,6 +481,7 @@ def main():
     ap.add_argument("--gex-max-dte", type=int, default=14, help="GEX expiry window in days (default 14)")
     ap.add_argument("--offline", action="store_true", help="serve only from the local cache/snapshot; no Terminal needed")
     ap.add_argument("--no-bulk", action="store_true", help="per-contract pulls instead of bulk-per-exp-day (slower; for parity/debug)")
+    ap.add_argument("--rs", type=float, default=None, help="cross-sectional relative-strength gate: only enter top-X%% leaders (e.g. 0.5)")
     args = ap.parse_args()
     sc.SKIP_OPEN_MINUTES = args.skip_open
     sc.SKIP_CLOSE_MINUTES = args.skip_close
@@ -521,6 +549,12 @@ def main():
         emit(f"  per-ticker GEX: size={'on' if args.gex_size else 'off'} "
              f"walls={'on' if args.gex_walls else 'off'} (max_dte={args.gex_max_dte})")
 
+    rs_leaders = None
+    if args.rs is not None:
+        warm_rs = int((pd.Timestamp(str(start)) - pd.Timedelta(days=WARMUP_CALENDAR_DAYS)).strftime("%Y%m%d"))
+        rs_leaders = rs_leader_sets(mk_client(), tickers, warm_rs, end, args.rs)
+        emit(f"  RS gate ON: only top {int(args.rs*100)}% leaders (cross-sectional return-since-open)")
+
     all_trades: list[dict] = []
     emit(f"{'='*118}")
     emit(f"  REAL-OPTIONS BACKTEST (ThetaData)  {args.start} -> {args.end}  ({len(tickers)} tickers, {args.workers} workers)")
@@ -539,7 +573,8 @@ def main():
             max_spread=args.max_spread, min_premium=args.min_premium, min_oi=args.min_oi,
             entry_cutoff_min=entry_cutoff_min, gex_by_day=gex_by_day, gex_threshold=gex_threshold,
             gex_intraday=gex_intraday, gex_size=args.gex_size, gex_walls=args.gex_walls,
-            gex_wall_tp=not args.no_wall_tp, gex_max_dte=args.gex_max_dte)
+            gex_wall_tp=not args.no_wall_tp, gex_max_dte=args.gex_max_dte,
+            rs_bars=(rs_leaders.get(tk) if rs_leaders is not None else None))
 
     done = 0
     with ThreadPoolExecutor(max_workers=args.workers) as ex:

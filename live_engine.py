@@ -63,11 +63,18 @@ class LiveEngine:
         sc_i = scores[i]
         if sc_i is None or sc_i != sc_i:        # NaN-safe
             return None
+        spot = float(bars["Close"].iloc[i])
+        # intraday return-since-open (for cross-sectional relative-strength ranking)
+        last = bars.index[i]
+        same_day = bars.index.strftime("%Y%m%d") == last.strftime("%Y%m%d")
+        day_open = float(bars["Open"][same_day].iloc[0])
+        ret_open = (spot - day_open) / day_open if day_open else 0.0
         return {
-            "ticker": ticker, "time": bars.index[i], "spot": float(bars["Close"].iloc[i]),
+            "ticker": ticker, "time": last, "spot": spot,
             "score": float(sc_i), "bullish": int(bull[i]), "bearish": int(bear[i]),
             "adx": float(adx[i]) if adx[i] == adx[i] else 0.0,
             "vwap": (float(vwap[i]) if vwap[i] == vwap[i] else None),
+            "ret_open": ret_open,
         }
 
     def entry_direction(self, st: dict) -> str | None:

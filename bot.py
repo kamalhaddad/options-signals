@@ -28,6 +28,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("bot")
 
 COOLDOWN_MIN = int(os.getenv("COOLDOWN_MINUTES", "30"))   # minutes between re-entries per ticker
+RS_QUANTILE = float(os.getenv("RS_QUANTILE", "0.5"))      # enter only top-X% leaders by return-since-open (0 = off)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -148,12 +149,26 @@ def scan() -> list:
     open_pos = {r["ticker"]: r for r in db.open_positions()}   # <-- restart-resume: source of truth is the DB
     out: list = []
 
+    # pass 1: latest signal for every ticker (one fetch each)
+    states: dict = {}
     for tk in config.WATCHLIST:
         try:
-            st = eng.latest(tk)
+            states[tk] = eng.latest(tk)
         except Exception as ex:
             log.warning(f"{tk}: latest() failed: {ex}")
-            continue
+            states[tk] = None
+
+    # cross-sectional relative strength: leaders = top RS_QUANTILE by return-since-open
+    leaders = None
+    if 0 < RS_QUANTILE < 1:
+        ranked = sorted(((s["ret_open"], tk) for tk, s in states.items()
+                         if s is not None and s.get("ret_open") is not None), reverse=True)
+        k = max(1, int(len(ranked) * RS_QUANTILE))
+        leaders = {tk for _, tk in ranked[:k]}
+
+    # pass 2: manage exits (always) and consider entries (gated by RS)
+    for tk in config.WATCHLIST:
+        st = states.get(tk)
 
         if tk in open_pos:
             pos = _posview(open_pos[tk])
@@ -170,8 +185,11 @@ def scan() -> list:
         if st is None:
             continue
         direction = eng.entry_direction(st)
+        if not direction:
+            continue
+        rs_leader = leaders is None or tk in leaders
         acted = False
-        if can_enter and direction:
+        if can_enter and rs_leader:
             lc = db.last_close_time(tk)
             on_cooldown = lc is not None and (now - lc).total_seconds() < COOLDOWN_MIN * 60
             if not on_cooldown:
@@ -184,13 +202,13 @@ def scan() -> list:
                     })
                     out.append(("entry", entry_embed(st, direction, c)))
                     acted = True
-        if direction:   # log the decision point (acted or not) for live-vs-backtest analysis
-            try:
-                db.log_signal({"ts": now, "ticker": tk, "spot": st["spot"], "score": st["score"],
-                               "adx": st["adx"], "bullish": st["bullish"], "bearish": st["bearish"],
-                               "direction": direction, "in_window": can_enter, "acted": acted, "note": None})
-            except Exception as ex:
-                log.warning(f"{tk}: log_signal failed: {ex}")
+        try:   # log the decision (incl. RS-blocked laggards) for live-vs-backtest analysis
+            db.log_signal({"ts": now, "ticker": tk, "spot": st["spot"], "score": st["score"],
+                           "adx": st["adx"], "bullish": st["bullish"], "bearish": st["bearish"],
+                           "direction": direction, "in_window": can_enter, "acted": acted,
+                           "note": None if rs_leader else "rs_laggard"})
+        except Exception as ex:
+            log.warning(f"{tk}: log_signal failed: {ex}")
     return out
 
 
@@ -367,6 +385,7 @@ async def status_cmd(ctx):
     e = discord.Embed(title="\U0001f916 Options Signal Bot (tuned)", color=discord.Color.blue())
     e.add_field(name="Scan", value=f"{config.SCAN_INTERVAL_MINUTES}m", inline=True)
     e.add_field(name="Signals", value="trend_clean + ADX>30", inline=True)
+    e.add_field(name="RS gate", value=(f"top {int(RS_QUANTILE*100)}%" if 0 < RS_QUANTILE < 1 else "off"), inline=True)
     e.add_field(name="Entry window", value="open → 12:00 ET", inline=True)
     e.add_field(name="Exits", value=f"+{int(sc.TAKE_PROFIT_PREMIUM_PCT)}% / -{int(sc.STOP_LOSS_PREMIUM_PCT)}% / opp / EOD", inline=True)
     e.add_field(name="Market", value="open" if session.is_market_open() else "closed", inline=True)
