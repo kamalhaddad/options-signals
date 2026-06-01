@@ -37,7 +37,9 @@ OTM_TARGET_PCT = 2.0
 OTM_MIN_PCT = 1.0
 OTM_MAX_PCT = 3.0
 MAX_IV = 1.50
-MAX_SPREAD_PCT = 6.0       # tight spread = better fills; the key execution lever (STRATEGY.md)
+MAX_SPREAD_PCT = 4.0       # tight spread = better fills; the key execution lever (STRATEGY.md).
+                           # Tightened 6->4 after live found the backtest's hist quotes optimistic vs
+                           # real spreads; 4% lifts realistic-fill edge (~+14%/tr @3% slip) + win rate.
 MIN_PREMIUM = 1.00         # skip dirt-cheap options (worst % spreads / slippage)
 MIN_OPEN_INTEREST = 250    # liquidity floor
 COMMISSION_PER_CONTRACT = 0.65

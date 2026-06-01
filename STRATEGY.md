@@ -24,7 +24,7 @@ The winning config is now the **default** (a no-flag run reproduces it).
 | Exits | **−50% stop / +40% TP** on premium, fixed from entry; + opposite-signal + EOD | Wide stop survives spread noise; let winners run |
 | Regime gate | **ADX > 30** | Skip chop — the single biggest expectancy lever |
 | **Session window** | **trade the open, NO new entries after 12:00 ET** (`SKIP_OPEN_MINUTES=0`, `ENTRY_CUTOFF="12:00"`) | Morning-session-only: capture open-momentum trends, cut the afternoon bleed. See below — lifts win rate AND total. |
-| Liquidity | **spread < 6%**, **OI ≥ 250**, premium ≥ $1 | Execution is THE lever — tight fills keep the edge |
+| Liquidity | **spread < 4%**, **OI ≥ 250**, premium ≥ $1 | Execution is THE lever. Tightened 6→4 after live showed backtest hist quotes are optimistic vs real spreads; 4% holds the realistic-fill edge (~+14%/tr @3% slip, 66% win) |
 | Fills | enter @ ask, exit @ bid, **+1.5% slippage**, $0.65/contract | Realistic; do not run at 0% slippage |
 | Sizing | `--risk 200` (fixed-$ risk/trade) optional | For total-$; %-expectancy is unchanged by sizing |
 
