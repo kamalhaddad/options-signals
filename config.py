@@ -56,7 +56,7 @@ WATCHLIST = [
 ]
 
 # Scan interval in minutes
-SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "15"))
+SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "2"))
 
 # Signal thresholds (score ranges from -1.0 to +1.0)
 BUY_THRESHOLD = 0.46    # High conviction
