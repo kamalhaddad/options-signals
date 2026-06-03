@@ -66,6 +66,11 @@ VOL_MODE = os.getenv("VOL_MODE", "current")
 # stand down when chop. Suppresses low-quality counter-trend PUTs in strong uptrends.
 MARKET_GATE = os.getenv("MARKET_GATE", "0") == "1"
 
+# High-conviction tag: an entry whose ATM IV rank is at/below this (cheap vol vs the name's own
+# ~20-day range) gets a ⭐ flag. LABEL only — does NOT gate entries (gating cuts alert volume).
+# Validated on the month: IV-rank ≤70% subset = 75% win / +22.3%/trade vs 71% / +19.5% baseline.
+IV_RANK_CONVICTION = float(os.getenv("IV_RANK_CONVICTION", "0.70"))
+
 # Signal thresholds (score ranges from -1.0 to +1.0)
 BUY_THRESHOLD = 0.46    # High conviction
 SELL_THRESHOLD = -0.25   # Exit on bearish flip

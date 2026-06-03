@@ -51,11 +51,16 @@ def entry_embed(st: dict, direction: str, c: dict) -> discord.Embed:
     is_call = direction == "CALL"
     color = discord.Color.green() if is_call else discord.Color.red()
     emoji = "\U0001f7e2" if is_call else "\U0001f534"
-    e = discord.Embed(title=f"{emoji} BUY {direction}: {st['ticker']} @ ${st['spot']:.2f}",
+    ivr = c.get("iv_rank")
+    high_conv = ivr is not None and ivr <= config.IV_RANK_CONVICTION
+    star = "⭐ " if high_conv else ""
+    e = discord.Embed(title=f"{emoji} {star}BUY {direction}: {st['ticker']} @ ${st['spot']:.2f}",
                       color=color, timestamp=datetime.now())
     e.add_field(name="Score", value=f"{st['score']:+.2f}", inline=True)
     e.add_field(name="ADX", value=f"{st['adx']:.0f}", inline=True)
     e.add_field(name="Agree", value=f"{st['bullish'] if is_call else st['bearish']}/5", inline=True)
+    conv = ("⭐ HIGH" if high_conv else "standard") + (f" (IV rank {ivr*100:.0f}%)" if ivr is not None else "")
+    e.add_field(name="Conviction", value=conv, inline=True)
     e.add_field(name="\U0001f4b0 Contract",
                 value=(f"**${c['strike_d']:.0f} {direction}** exp {c['exp_date']} ({c['dte']}d)\n"
                        f"Ask **${c['ask']:.2f}**  bid ${c['bid']:.2f}  (spread {c['spread']:.1f}%)\n"
@@ -209,6 +214,11 @@ def scan() -> list:
             if not on_cooldown:
                 c = eng.pick_and_quote(tk, direction, st["spot"], st["time"])
                 if c:
+                    try:   # conviction tag (IV rank) — best-effort, never blocks an alert
+                        c["iv_rank"] = eng.iv_rank(tk, int(now.strftime("%Y%m%d")))
+                    except Exception as ex:
+                        log.warning(f"{tk}: iv_rank failed: {ex}")
+                        c["iv_rank"] = None
                     db.open_trade({
                         "ticker": tk, "direction": direction, "strike": c["strike"], "strike_d": c["strike_d"],
                         "exp": c["exp"], "exp_date": c["exp_date"], "qty": 1, "score": round(st["score"], 3),

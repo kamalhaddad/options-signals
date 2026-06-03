@@ -53,6 +53,7 @@ class LiveEngine:
         self.max_spread = max_spread
         self.min_premium = min_premium
         self.min_oi = min_oi
+        self._iv_rank_memo: dict = {}   # (ticker, day) -> IV rank (computed once/day per ticker)
 
     # ── signal ────────────────────────────────────────────────────────────────
     def latest(self, ticker: str, date_i: int | None = None) -> dict | None:
@@ -174,6 +175,54 @@ class LiveEngine:
             return None
         b = float(q.iloc[-1]["bid"])
         return b if b > 0 else None
+
+    # ── conviction (IV rank) ─────────────────────────────────────────────────────
+    def iv_rank(self, ticker: str, day: int | None = None, lookback: int = 20) -> float | None:
+        """IV rank (0..1) of today's ATM IV within the trailing `lookback` trading days; low =
+        cheap vol = higher-conviction call/put (see vol_research / SIGNALS.md). Memoized per
+        (ticker, day) — computed at most once per ticker per day. None on insufficient data;
+        the caller treats None as 'no conviction tag', never an error."""
+        day = day or today_et()
+        key = (ticker, day)
+        if key in self._iv_rank_memo:
+            return self._iv_rank_memo[key]
+        try:
+            rank = self._compute_iv_rank(ticker, day, lookback)
+        except Exception:
+            rank = None
+        self._iv_rank_memo[key] = rank
+        return rank
+
+    def _compute_iv_rank(self, ticker: str, day: int, lookback: int) -> float | None:
+        d_ts = pd.Timestamp(str(day))
+        start = int((d_ts - pd.Timedelta(days=lookback * 2 + 10)).strftime("%Y%m%d"))
+        bars = self.bt.c.stock_ohlc(ticker, start, day)
+        if bars.empty:
+            return None
+        day_spot: dict = {}
+        for ts, row in bars.iterrows():
+            day_spot.setdefault(int(ts.strftime("%Y%m%d")), float(row["Open"]))
+        all_exps = self.bt.expirations(ticker)
+        series: dict = {}
+        for dd, spot in day_spot.items():
+            dts = pd.Timestamp(str(dd))
+            exps = [e for e in all_exps if 3 <= (tb.exp_to_date(e) - dts).days <= 35]
+            if not exps:
+                continue
+            exp = min(exps, key=lambda e: (tb.exp_to_date(e) - dts).days)
+            strikes = [(s, strike_to_dollars(s)) for s in self.bt.strikes(ticker, exp)]
+            if not strikes:
+                continue
+            sk, _ = min(strikes, key=lambda x: abs(x[1] - spot))
+            iv = self.bt._iv(ticker, exp, sk, "C", dd)
+            if iv and iv > 0:
+                series[dd] = iv
+        days = sorted(k for k in series if k <= day)
+        if day not in series or len(days) < 10:       # need enough trailing history to rank
+            return None
+        window = days[-lookback:]
+        vals = [series[k] for k in window]
+        return sum(1 for v in vals if v <= series[day]) / len(vals)
 
 
 if __name__ == "__main__":
