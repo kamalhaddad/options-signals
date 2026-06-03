@@ -56,7 +56,7 @@ WATCHLIST = [
 ]
 
 # Scan interval in minutes
-SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "2"))
+SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "1"))
 
 # Long/short symmetry — how the (direction-blind) volume signal votes.
 #   "current"     = legacy, volume only votes bullish (CALL-biased; bot was long-only)
