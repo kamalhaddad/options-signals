@@ -32,12 +32,12 @@ MIN_BULLISH_INDICATORS = 4
 STOP_LOSS_PREMIUM_PCT = 50.0      # exit if premium falls 50% below entry
 TAKE_PROFIT_PREMIUM_PCT = 40.0    # exit if premium rises 40% above entry
 
-# Time filters (minutes of the regular session to skip). Morning-session-only edge:
-# trade the open (skip 0), no new entries after ENTRY_CUTOFF_MINUTE (12:00 ET = 750
-# min from midnight). Validated on the 215-trade month + 24h/72h windows.
+# Time filters (minutes of the regular session to skip). Trade the open (skip 0).
+# Entry cutoff DISABLED — entries allowed all session (was 12:00 ET morning-only edge,
+# validated on the 215-trade month + 24h/72h; removed by request to trade afternoons too).
 SKIP_OPEN_MINUTES = 0
 SKIP_CLOSE_MINUTES = 15
-ENTRY_CUTOFF_MINUTE = 12 * 60     # 12:00 ET; new entries blocked after this
+ENTRY_CUTOFF_MINUTE = None         # None = no cutoff; entries allowed until skip-close
 
 # Technical indicator weights (must sum to 1.0) — 6 indicators
 WEIGHTS = {
