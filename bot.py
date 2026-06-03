@@ -142,7 +142,7 @@ def weekly_summary_embed(week_label: str, trades: list) -> discord.Embed:
 # ── core scan (sync; runs in a worker thread) ─────────────────────────────────────
 def scan() -> list:
     """One pass. Open positions come FROM THE DB (restart-safe); entries/exits commit immediately."""
-    eng = LiveEngine()
+    eng = LiveEngine(vol_mode=config.VOL_MODE)
     now = session.now_et()
     eod = session.is_eod(now)
     can_enter = session.in_entry_window(now)
@@ -158,15 +158,24 @@ def scan() -> list:
             log.warning(f"{tk}: latest() failed: {ex}")
             states[tk] = None
 
-    # cross-sectional relative strength: leaders = top RS_QUANTILE by return-since-open
-    leaders = None
+    # cross-sectional relative strength (direction-aware): leaders = top RS_QUANTILE by
+    # return-since-open (→ CALL), laggards = bottom RS_QUANTILE (→ PUT).
+    leaders = laggards = None
     if 0 < RS_QUANTILE < 1:
         ranked = sorted(((s["ret_open"], tk) for tk, s in states.items()
                          if s is not None and s.get("ret_open") is not None), reverse=True)
         k = max(1, int(len(ranked) * RS_QUANTILE))
         leaders = {tk for _, tk in ranked[:k]}
+        laggards = {tk for _, tk in ranked[-k:]}
 
-    # pass 2: manage exits (always) and consider entries (gated by RS)
+    # broad-market (SPY) regime: only CALL when bullish, only PUT when bearish (None = gate off
+    # or SPY data missing → fail open). Suppresses counter-trend trades in a one-way tape.
+    spy_reg = None
+    if config.MARKET_GATE:
+        spy_st = states.get("SPY")
+        spy_reg = spy_st.get("regime") if spy_st else None
+
+    # pass 2: manage exits (always) and consider entries (gated by RS + market regime)
     for tk in config.WATCHLIST:
         st = states.get(tk)
 
@@ -187,9 +196,11 @@ def scan() -> list:
         direction = eng.entry_direction(st)
         if not direction:
             continue
-        rs_leader = leaders is None or tk in leaders
+        rs_ok = leaders is None or (tk in leaders if direction == "CALL" else tk in laggards)
+        mkt_ok = (not config.MARKET_GATE) or spy_reg is None or \
+                 (spy_reg > 0 if direction == "CALL" else spy_reg < 0)
         acted = False
-        if can_enter and rs_leader:
+        if can_enter and rs_ok and mkt_ok:
             lc = db.last_close_time(tk)
             on_cooldown = lc is not None and (now - lc).total_seconds() < COOLDOWN_MIN * 60
             if not on_cooldown:
@@ -206,7 +217,8 @@ def scan() -> list:
             db.log_signal({"ts": now, "ticker": tk, "spot": st["spot"], "score": st["score"],
                            "adx": st["adx"], "bullish": st["bullish"], "bearish": st["bearish"],
                            "direction": direction, "in_window": can_enter, "acted": acted,
-                           "note": None if rs_leader else "rs_laggard"})
+                           "note": (("rs_not_leader" if direction == "CALL" else "rs_not_laggard") if not rs_ok
+                                    else ("mkt_regime" if not mkt_ok else None))})
         except Exception as ex:
             log.warning(f"{tk}: log_signal failed: {ex}")
     return out
@@ -223,7 +235,7 @@ def eod_collect():
         return None
     eng = None
     for row in db.open_positions():                 # safety net: close anything still open
-        eng = eng or LiveEngine()
+        eng = eng or LiveEngine(vol_mode=config.VOL_MODE)
         pos = _posview(row)
         bid = eng.current_bid(pos["ticker"], pos["exp"], pos["strike"], pos["right"])
         pnl = ((bid - pos["entry"]) / pos["entry"] * 100) if (bid and pos["entry"]) else 0.0
@@ -255,7 +267,7 @@ def rank_candidates(limit: int = 10):
     """Top tickers by |score| right now, each tagged with which gate it clears/fails — the
     same decision logic scan() uses. Returns (list[dict], now). Heavy (one latest() per
     ticker); run in a worker thread."""
-    eng = LiveEngine()
+    eng = LiveEngine(vol_mode=config.VOL_MODE)
     now = session.now_et()
     can_enter = session.in_entry_window(now)
     states = {}
@@ -266,11 +278,18 @@ def rank_candidates(limit: int = 10):
             states[tk] = None
     valid = {tk: s for tk, s in states.items() if s is not None}
 
-    leaders = None
+    leaders = laggards = None
     if 0 < RS_QUANTILE < 1:
         ranked = sorted(((s["ret_open"], tk) for tk, s in valid.items() if s.get("ret_open") is not None),
                         reverse=True)
-        leaders = {tk for _, tk in ranked[:max(1, int(len(ranked) * RS_QUANTILE))]}
+        k = max(1, int(len(ranked) * RS_QUANTILE))
+        leaders = {tk for _, tk in ranked[:k]}
+        laggards = {tk for _, tk in ranked[-k:]}
+
+    spy_reg = None
+    if config.MARKET_GATE:
+        spy_st = valid.get("SPY")
+        spy_reg = spy_st.get("regime") if spy_st else None
 
     out = []
     req = eng.required
@@ -278,7 +297,15 @@ def rank_candidates(limit: int = 10):
         score, adx = st["score"], st["adx"]
         is_call, is_put = score >= sc.BUY_THRESHOLD, score <= -sc.BUY_THRESHOLD
         d = "CALL" if is_call else ("PUT" if is_put else "—")
-        leader = leaders is None or tk in leaders
+        # direction-aware RS: CALL needs leader, PUT needs laggard
+        if leaders is None:
+            rs_pass = True
+        elif is_call:
+            rs_pass = tk in leaders
+        elif is_put:
+            rs_pass = tk in laggards
+        else:
+            rs_pass = False
         if not (is_call or is_put):
             status = f"no signal (|{score:+.2f}|<{sc.BUY_THRESHOLD})"
         elif eng.adx_gate > 0 and adx < eng.adx_gate:
@@ -287,13 +314,15 @@ def rank_candidates(limit: int = 10):
             status = f"breadth {(st['bullish'] if is_call else st['bearish'])}/{req}"
         elif not can_enter:
             status = "outside window"
-        elif not leader:
-            status = "RS laggard"
+        elif not rs_pass:
+            status = "RS-rank wrong side" if is_put else "RS laggard"
+        elif config.MARKET_GATE and spy_reg is not None and (spy_reg <= 0 if is_call else spy_reg >= 0):
+            status = f"mkt regime {spy_reg:+d}"
         else:
             lc = db.last_close_time(tk)
             status = "cooldown" if (lc is not None and (now - lc).total_seconds() < COOLDOWN_MIN * 60) else "✅ tradeable"
         out.append({"ticker": tk, "score": score, "adx": adx, "ret": st["ret_open"] * 100,
-                    "leader": leader, "dir": d, "status": status})
+                    "leader": rs_pass, "dir": d, "status": status})
     return out, now
 
 
@@ -305,7 +334,7 @@ def candidates_embed(cands: list, now) -> discord.Embed:
         lines.append(f"{mark} **{c['ticker']}** {c['score']:+.2f} · ADX {c['adx']:.0f} · "
                      f"RS{'✓' if c['leader'] else '✗'} · {c['ret']:+.1f}% → {c['dir']} ({c['status']})")
     e.description = "\n".join(lines) or "no data"
-    e.set_footer(text="entry needs score≥0.46 + 4/5 breadth + ADX>30 + RS-leader + liquid contract")
+    e.set_footer(text="entry needs score≥0.46 + 4/5 breadth + ADX>30 + RS (leader→CALL / laggard→PUT) + liquid contract")
     return e
 
 
@@ -372,7 +401,7 @@ async def check(ctx, ticker: str):
     """!check NVDA — latest signal + would-be entry for one ticker."""
     tk = ticker.upper()
     await ctx.send(f"\U0001f50d Analyzing **{tk}**…")
-    eng = LiveEngine()
+    eng = LiveEngine(vol_mode=config.VOL_MODE)
     st = await asyncio.to_thread(eng.latest, tk)
     if st is None:
         await ctx.send(f"❌ No data for **{tk}** (market closed or insufficient bars)")
@@ -451,7 +480,7 @@ async def status_cmd(ctx):
     e = discord.Embed(title="\U0001f916 Options Signal Bot (tuned)", color=discord.Color.blue())
     e.add_field(name="Scan", value=f"{config.SCAN_INTERVAL_MINUTES}m", inline=True)
     e.add_field(name="Signals", value="trend_clean + ADX>30", inline=True)
-    e.add_field(name="RS gate", value=(f"top {int(RS_QUANTILE*100)}%" if 0 < RS_QUANTILE < 1 else "off"), inline=True)
+    e.add_field(name="RS gate", value=(f"top/bottom {int(RS_QUANTILE*100)}% (CALL/PUT)" if 0 < RS_QUANTILE < 1 else "off"), inline=True)
     e.add_field(name="Entry window", value="open → 12:00 ET", inline=True)
     e.add_field(name="Exits", value=f"+{int(sc.TAKE_PROFIT_PREMIUM_PCT)}% / -{int(sc.STOP_LOSS_PREMIUM_PCT)}% / opp / EOD", inline=True)
     e.add_field(name="Market", value="open" if session.is_market_open() else "closed", inline=True)

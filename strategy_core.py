@@ -406,8 +406,17 @@ def compute_latest_signal(df: pd.DataFrame) -> dict:
     }
 
 
-def compute_signals_series(df: pd.DataFrame, weights: dict | None = None):
+def compute_signals_series(df: pd.DataFrame, weights: dict | None = None, vol_mode: str = "current"):
     """Vectorized: compute (score, bullish, bearish, adx) for EVERY bar at once.
+
+    vol_mode controls how the (inherently direction-blind) volume signal is treated —
+    this is the long/short SYMMETRY knob (volume normally only ever votes bullish, which
+    structurally starves the PUT breadth gate):
+      "current"     — volume score is +only, counts toward bullish breadth (legacy; parity)
+      "directional" — volume confirms the move: its magnitude is signed by the other active
+                      signals' consensus, so a heavy red bar votes BEARISH (symmetric breadth)
+      "conviction"  — volume still feeds the score, but is EXCLUDED from bull/bear breadth
+                      counts (breadth = directional signals only; symmetric)
 
     Indicators are computed once over the whole series; only the cheap per-bar
     scoring runs in the loop. `weights` selects WHICH signals are active and their
@@ -460,9 +469,17 @@ def compute_signals_series(df: pd.DataFrame, weights: dict | None = None):
             s["volume"] = score_volume(float(volume.iloc[i]), av) if av > 0 else 0.0
             if "vwap" in norm:
                 s["vwap"] = score_vwap(float(close.iloc[i]), float(vwap.iloc[i]))
+            # symmetry knob: sign the volume vote by the directional consensus of the
+            # OTHER active signals so a heavy red bar can vote bearish (not just bullish).
+            if vol_mode == "directional" and "volume" in norm and s["volume"] > 0:
+                consensus = sum(s[k] * norm[k] for k in norm if k != "volume")
+                if consensus < 0:
+                    s["volume"] = -s["volume"]
             scores.append(sum(s[k] * norm[k] for k in norm))
-            bullish.append(sum(1 for k in norm if s[k] > 0))
-            bearish.append(sum(1 for k in norm if s[k] < 0))
+            # "conviction": volume feeds the score but is not a breadth vote (symmetric).
+            count_keys = [k for k in norm if not (vol_mode == "conviction" and k == "volume")]
+            bullish.append(sum(1 for k in count_keys if s[k] > 0))
+            bearish.append(sum(1 for k in count_keys if s[k] < 0))
         except (ValueError, IndexError):
             scores.append(0.0)
             bullish.append(0)

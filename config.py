@@ -58,6 +58,14 @@ WATCHLIST = [
 # Scan interval in minutes
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "2"))
 
+# Long/short symmetry — how the (direction-blind) volume signal votes.
+#   "current"     = legacy, volume only votes bullish (CALL-biased; bot was long-only)
+#   "directional" = volume confirms the move (heavy red bar votes bearish) → enables quality PUTs
+VOL_MODE = os.getenv("VOL_MODE", "current")
+# Broad-market (SPY) regime gate: only CALL when SPY is bullish, only PUT when bearish,
+# stand down when chop. Suppresses low-quality counter-trend PUTs in strong uptrends.
+MARKET_GATE = os.getenv("MARKET_GATE", "0") == "1"
+
 # Signal thresholds (score ranges from -1.0 to +1.0)
 BUY_THRESHOLD = 0.46    # High conviction
 SELL_THRESHOLD = -0.25   # Exit on bearish flip
