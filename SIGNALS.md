@@ -11,7 +11,7 @@
 | Signal | Verdict | Live? | Where |
 |---|---|---|---|
 | **Relative strength (cross-sectional)** | ✅ passes (free lunch) | **LIVE** (`RS_QUANTILE=0.5`) | `bot.py`, `theta_backtest.py --rs`, `rs_research.py` |
-| **IV rank (vol surface)** | ✅ passes (quality↑, volume↓) | banked (not live) | `vol_research.py` |
+| **IV rank (vol surface)** | ✅ passes (quality↑, volume↓) | **LIVE as a ⭐ label** (IV≤70%, not a gate) | `vol_research.py`, `live_engine.iv_rank`, `bot.entry_embed` |
 | **Dealer gamma (GEX)** | ❌ rejected (negative selectivity) | off (opt-in flags) | `gex.py`, `gex_sweep.py`, STRATEGY.md |
 | skew / term-structure / VRP | untested | — | (next) |
 
@@ -26,7 +26,16 @@ A *free lunch*: win rate, expectancy, AND total all up (cuts only ~15 weak trade
 Top-33% over-filters (total < baseline). **Live at top-50%** — the bot computes RS each scan
 in `scan()` (pass-1 collects `latest()`; leaders = top `RS_QUANTILE`).
 
-## 2. IV rank (vol surface) — researched, BANKED ⏸️
+## 2. IV rank (vol surface) — LIVE as a conviction label ✅ (2026-06-03)
+
+**Shipped as a ⭐ tag, not a gate.** Re-validated on the month with the *current live config*
+(RS + directional + market-gate): IV-rank ≤70% subset = **75% win / +22.3%/tr** vs 71% / +19.5%
+baseline (≤50% → 79% / +25.0%; ≤30% → 82% / +30.6%). Gating would cut alert volume (and some
+rich-vol winners), so instead `bot.entry_embed` flags entries with ATM IV rank ≤ `IV_RANK_CONVICTION`
+(0.70) as ⭐ HIGH conviction — full signal flow kept, quality subset surfaced. `LiveEngine.iv_rank`
+computes the per-(ticker,day) ATM-IV-rank once/day (memoized), best-effort (None = no tag).
+
+### Original research (post-filter, BANKED before going live) ⏸️
 
 "Don't overpay for rich vol." Per ticker, percentile of today's ATM IV vs its ~20-day range
 (low = cheap). Gate entries to low IV-rank. **Positive selectivity** (the opposite of GEX) —
