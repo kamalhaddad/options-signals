@@ -170,7 +170,10 @@ class ThetaBacktest:
                    max_spread=MAX_SPREAD_PCT, min_premium=MIN_PREMIUM, min_oi=0,
                    entry_cutoff_min=None, gex_by_day=None, gex_threshold=None,
                    gex_intraday=None, gex_size=False, gex_walls=False, gex_wall_tp=True,
-                   gex_max_dte=14, rs_bars=None) -> list[dict]:
+                   gex_max_dte=14, rs_bars=None, rs_lag_bars=None,
+                   exit_mode="baseline", decay_floor=0.15, catastrophic=60.0,
+                   be_trigger=25.0, init_stop=35.0, ref_iv=0.6,
+                   vol_mode="current", put_required=None) -> list[dict]:
         warm_start = int((pd.Timestamp(str(start)) - pd.Timedelta(days=WARMUP_CALENDAR_DAYS)).strftime("%Y%m%d"))
         bars = self.c.stock_ohlc(root, warm_start, end)
         if bars.empty:
@@ -181,7 +184,7 @@ class ThetaBacktest:
         pos = {}
 
         # Compute every bar's signal once (vectorized) instead of per-bar rebuilds.
-        scores, bull_counts, bear_counts, adx_vals, vwap_vals = sc.compute_signals_series(bars, weights)
+        scores, bull_counts, bear_counts, adx_vals, vwap_vals = sc.compute_signals_series(bars, weights, vol_mode)
         if required is None:
             required = sc.MIN_BULLISH_INDICATORS
         closes = bars["Close"].to_numpy(dtype=float)
@@ -208,14 +211,19 @@ class ThetaBacktest:
                 if bid is not None and pos["entry"] > 0:
                     pos["peak"] = max(pos.get("peak", pos["entry"]), bid)
                     pnl = (bid - pos["entry"]) / pos["entry"] * 100
-                    if pnl >= sc.TAKE_PROFIT_PREMIUM_PCT:
-                        exit_reason = f"take profit (+{pnl:.0f}% prem)"
-                    elif trail > 0:
-                        drop = (pos["peak"] - bid) / pos["peak"] * 100 if pos["peak"] else 0.0
-                        if drop >= trail:
-                            exit_reason = f"trailing stop ({pnl:.0f}% prem)"
-                    elif pnl <= -sc.STOP_LOSS_PREMIUM_PCT:
-                        exit_reason = f"stop loss ({pnl:.0f}% prem)"
+                    if exit_mode == "baseline":
+                        if pnl >= sc.TAKE_PROFIT_PREMIUM_PCT:
+                            exit_reason = f"take profit (+{pnl:.0f}% prem)"
+                        elif trail > 0:
+                            drop = (pos["peak"] - bid) / pos["peak"] * 100 if pos["peak"] else 0.0
+                            if drop >= trail:
+                                exit_reason = f"trailing stop ({pnl:.0f}% prem)"
+                        elif pnl <= -sc.STOP_LOSS_PREMIUM_PCT:
+                            exit_reason = f"stop loss ({pnl:.0f}% prem)"
+                    else:
+                        exit_reason = self._adaptive_exit_reason(
+                            pos, bid, pnl, score, spot, vwap_vals[i], trail,
+                            exit_mode, decay_floor, catastrophic, be_trigger, init_stop)
                 if exit_reason is None and pos.get("target_level") is not None:
                     tl = pos["target_level"]
                     if (pos["dir"] == "CALL" and spot >= tl) or (pos["dir"] == "PUT" and spot <= tl):
@@ -246,9 +254,14 @@ class ThetaBacktest:
                 gex_ok = gex_by_day.get(int(t.strftime("%Y%m%d")), 1e18) <= gex_threshold
             else:
                 gex_ok = True
-            # cross-sectional relative-strength gate: only enter when this ticker is a
-            # leader at this bar (rs_bars = set of allowed "YYYYMMDDHHMM" for this ticker).
-            rs_ok = rs_bars is None or t.strftime("%Y%m%d%H%M") in rs_bars
+            # cross-sectional relative-strength gate (direction-aware): CALL needs the ticker
+            # to be a leader at this bar, PUT needs it to be a laggard. rs_bars/rs_lag_bars =
+            # sets of allowed "YYYYMMDDHHMM" for this ticker (None = RS gate off).
+            tkey = t.strftime("%Y%m%d%H%M")
+            rs_off = rs_bars is None
+            is_leader = rs_off or tkey in rs_bars
+            is_laggard = rs_off or (rs_lag_bars is not None and tkey in rs_lag_bars)
+            rs_ok = is_leader or is_laggard
             if (not in_trade and in_request_window and score is not None and self._within_window(t)
                     and not is_last_of_day and before_cutoff and gex_ok and rs_ok):
                 adx_ok = adx_gate <= 0 or (adx_vals[i] == adx_vals[i] and adx_vals[i] >= adx_gate)
@@ -260,9 +273,10 @@ class ThetaBacktest:
                 mkt_call = reg is None or reg > 0
                 mkt_put = reg is None or reg < 0
                 direction = None
-                if adx_ok and mkt_call and score >= sc.BUY_THRESHOLD and bullish >= required and (not vwap_gate or above_vwap):
+                put_req = put_required if put_required is not None else required
+                if adx_ok and mkt_call and is_leader and score >= sc.BUY_THRESHOLD and bullish >= required and (not vwap_gate or above_vwap):
                     direction = "CALL"
-                elif adx_ok and mkt_put and score <= -sc.BUY_THRESHOLD and bearish >= required and (not vwap_gate or below_vwap):
+                elif adx_ok and mkt_put and is_laggard and score <= -sc.BUY_THRESHOLD and bearish >= put_req and (not vwap_gate or below_vwap):
                     direction = "PUT"
                 # ── per-ticker GEX: conviction sizing + gamma-wall strike/TP ──────
                 eff_moneyness, eff_risk, target_level = moneyness, risk, None
@@ -293,6 +307,8 @@ class ThetaBacktest:
                                             slippage, max_spread, min_premium, min_oi)
                     if opened:
                         opened["target_level"] = target_level
+                        iv = opened.get("iv")
+                        opened["vol_mult"] = min(2.0, max(0.6, iv / ref_iv)) if (iv and ref_iv > 0) else 1.0
                         pos = opened
                         in_trade = True
         return trades
@@ -305,6 +321,56 @@ class ThetaBacktest:
         if 0 < minutes_to_close <= sc.SKIP_CLOSE_MINUTES:
             return False
         return True
+
+    @staticmethod
+    def _adaptive_exit_reason(pos, bid, pnl, score, spot, vw, trail,
+                              mode, decay_floor, catastrophic, be_trigger, init_stop):
+        """Smarter exits than the fixed +TP/-SL cap. Returns a reason string or None.
+        All modes share a catastrophic premium backstop; then per-mode logic:
+          decay   — ride until the entry momentum fades (score < floor or lost VWAP)
+          ratchet — initial stop, then snap to breakeven after +be_trigger%, then trail
+          vol     — TP/SL brackets scaled by the option's IV (pos['vol_mult'])
+          combo   — IV-scaled initial stop + breakeven ratchet (down) + signal-decay TP (up)
+        """
+        entry, peak = pos["entry"], pos["peak"]
+        peak_gain = (peak - entry) / entry * 100 if entry > 0 else 0.0
+        vm = pos.get("vol_mult", 1.0)
+        is_call = pos["dir"] == "CALL"
+        if pnl <= -catastrophic:
+            return f"catastrophic ({pnl:.0f}% prem)"
+
+        def decayed():
+            if score is None:
+                return False
+            faded = (score < decay_floor) if is_call else (score > -decay_floor)
+            lost_vwap = (vw == vw) and ((spot < vw) if is_call else (spot > vw))
+            return faded or lost_vwap
+
+        def ratchet(eff_init_stop):
+            if peak_gain >= be_trigger:
+                lock = max(entry, peak * (1 - trail / 100)) if trail > 0 else entry
+                if bid <= lock:
+                    return f"ratchet stop ({pnl:.0f}% prem)"
+            elif pnl <= -eff_init_stop:
+                return f"init stop ({pnl:.0f}% prem)"
+            return None
+
+        if mode == "decay":
+            return f"signal decay ({pnl:.0f}% prem)" if decayed() else None
+        if mode == "ratchet":
+            return ratchet(init_stop)
+        if mode == "vol":
+            if pnl >= sc.TAKE_PROFIT_PREMIUM_PCT * vm:
+                return f"vol TP (+{pnl:.0f}% prem)"
+            if pnl <= -sc.STOP_LOSS_PREMIUM_PCT * vm:
+                return f"vol stop ({pnl:.0f}% prem)"
+            return None
+        if mode == "combo":
+            r = ratchet(init_stop * vm)
+            if r:
+                return r
+            return f"signal decay ({pnl:.0f}% prem)" if decayed() else None
+        return None
 
     def _quote_at(self, pos: dict, t: pd.Timestamp, field: str):
         df = pos["quotes"]
@@ -363,7 +429,7 @@ class ThetaBacktest:
             "root": root, "dir": direction, "exp": exp, "strike": strike, "right": right,
             "otm_pct": otm_pct, "entry": entry_fill, "entry_bid": entry_bid, "qty": qty,
             "entry_time": t, "entry_spot": spot, "entry_i": i,
-            "score": round(score, 3), "quotes": quotes,
+            "score": round(score, 3), "quotes": quotes, "iv": iv,
         }
 
     def _ticker_profile(self, root, day, ref_spot, max_dte):
@@ -424,8 +490,11 @@ class ThetaBacktest:
 
 
 def rs_leader_sets(client, tickers, start, end, quantile):
-    """Cross-sectional relative strength: {ticker: set('YYYYMMDDHHMM' where it's a top-`quantile`
-    leader by intraday return-since-open)}. Uses only stock bars (no look-ahead: bar-t closes)."""
+    """Cross-sectional relative strength by intraday return-since-open (no look-ahead:
+    bar-t closes). Returns (leaders, laggards), each {ticker: set('YYYYMMDDHHMM')}:
+      leaders  = top-`quantile`    (strongest → CALL candidates)
+      laggards = bottom-`quantile`  (weakest   → PUT candidates)
+    Direction-aware: a PUT on a laggard is the bearish mirror of a CALL on a leader."""
     rets = {}
     for tk in tickers:
         b = client.stock_ohlc(tk, start, end)
@@ -438,13 +507,17 @@ def rs_leader_sets(client, tickers, start, end, quantile):
             if r == r:
                 rets.setdefault(ts.strftime("%Y%m%d%H%M"), {})[tk] = float(r)
     leaders = {tk: set() for tk in tickers}
+    laggards = {tk: set() for tk in tickers}
     for ts_str, d in rets.items():
         if len(d) < 5:
             continue
         ranked = sorted(d.items(), key=lambda x: -x[1])
-        for tk, _ in ranked[:max(1, int(len(ranked) * quantile))]:
+        k = max(1, int(len(ranked) * quantile))
+        for tk, _ in ranked[:k]:
             leaders[tk].add(ts_str)
-    return leaders
+        for tk, _ in ranked[-k:]:
+            laggards[tk].add(ts_str)
+    return leaders, laggards
 
 
 def main():
@@ -484,6 +557,21 @@ def main():
     ap.add_argument("--offline", action="store_true", help="serve only from the local cache/snapshot; no Terminal needed")
     ap.add_argument("--no-bulk", action="store_true", help="per-contract pulls instead of bulk-per-exp-day (slower; for parity/debug)")
     ap.add_argument("--rs", type=float, default=None, help="cross-sectional relative-strength gate: only enter top-X%% leaders (e.g. 0.5)")
+    # ── adaptive exits (smarter than the fixed +TP/-SL cap) ───────────────────
+    ap.add_argument("--exit-mode", choices=["baseline", "decay", "ratchet", "vol", "combo"], default="baseline",
+                    help="exit strategy: baseline=fixed TP/SL (+trail); decay=exit when signal fades; "
+                         "ratchet=breakeven+trail lock-in; vol=IV-scaled brackets; combo=vol-stop+decay-TP+breakeven")
+    ap.add_argument("--decay-floor", type=float, default=0.15, help="decay/combo: exit when |score| falls below this (momentum gone)")
+    ap.add_argument("--catastrophic", type=float, default=60.0, help="adaptive modes: hard premium backstop stop %%")
+    ap.add_argument("--be-trigger", type=float, default=25.0, help="ratchet/combo: peak gain %% that snaps the stop to breakeven")
+    ap.add_argument("--init-stop", type=float, default=35.0, help="ratchet/combo: initial premium stop %% before breakeven")
+    ap.add_argument("--ref-iv", type=float, default=0.6, help="vol/combo: option IV that maps to 1.0x bracket scaling")
+    # ── long/short symmetry (why PUTs never fire): volume only ever votes bullish ──
+    ap.add_argument("--vol-mode", choices=["current", "directional", "conviction"], default="current",
+                    help="volume treatment: current=+only (legacy, CALL-biased); directional=volume confirms the move; "
+                         "conviction=volume scores but is excluded from breadth (symmetric)")
+    ap.add_argument("--put-min-conv", type=int, default=None,
+                    help="separate breadth requirement for PUTs only (asymmetric short-side relax; None = same as CALL)")
     args = ap.parse_args()
     sc.SKIP_OPEN_MINUTES = args.skip_open
     sc.SKIP_CLOSE_MINUTES = args.skip_close
@@ -551,11 +639,11 @@ def main():
         emit(f"  per-ticker GEX: size={'on' if args.gex_size else 'off'} "
              f"walls={'on' if args.gex_walls else 'off'} (max_dte={args.gex_max_dte})")
 
-    rs_leaders = None
+    rs_leaders = rs_laggards = None
     if args.rs is not None:
         warm_rs = int((pd.Timestamp(str(start)) - pd.Timedelta(days=WARMUP_CALENDAR_DAYS)).strftime("%Y%m%d"))
-        rs_leaders = rs_leader_sets(mk_client(), tickers, warm_rs, end, args.rs)
-        emit(f"  RS gate ON: only top {int(args.rs*100)}% leaders (cross-sectional return-since-open)")
+        rs_leaders, rs_laggards = rs_leader_sets(mk_client(), tickers, warm_rs, end, args.rs)
+        emit(f"  RS gate ON: CALL=top {int(args.rs*100)}% leaders / PUT=bottom {int(args.rs*100)}% laggards (return-since-open)")
 
     all_trades: list[dict] = []
     emit(f"{'='*118}")
@@ -576,7 +664,11 @@ def main():
             entry_cutoff_min=entry_cutoff_min, gex_by_day=gex_by_day, gex_threshold=gex_threshold,
             gex_intraday=gex_intraday, gex_size=args.gex_size, gex_walls=args.gex_walls,
             gex_wall_tp=not args.no_wall_tp, gex_max_dte=args.gex_max_dte,
-            rs_bars=(rs_leaders.get(tk) if rs_leaders is not None else None))
+            rs_bars=(rs_leaders.get(tk) if rs_leaders is not None else None),
+            rs_lag_bars=(rs_laggards.get(tk) if rs_laggards is not None else None),
+            exit_mode=args.exit_mode, decay_floor=args.decay_floor, catastrophic=args.catastrophic,
+            be_trigger=args.be_trigger, init_stop=args.init_stop, ref_iv=args.ref_iv,
+            vol_mode=args.vol_mode, put_required=args.put_min_conv)
 
     done = 0
     with ThreadPoolExecutor(max_workers=args.workers) as ex:

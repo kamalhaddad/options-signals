@@ -42,9 +42,10 @@ class LiveEngine:
     def __init__(self, client: ThetaClient | None = None, signals: str = "trend_clean",
                  adx_gate: float = 30.0, moneyness: float = tb.OTM_TARGET_PCT,
                  max_spread: float = tb.MAX_SPREAD_PCT, min_premium: float = tb.MIN_PREMIUM,
-                 min_oi: int = tb.MIN_OPEN_INTEREST):
+                 min_oi: int = tb.MIN_OPEN_INTEREST, vol_mode: str = "current"):
         self.bt = tb.ThetaBacktest(client or ThetaClient())
         self.weights = tb.SIGNAL_PRESETS[signals]
+        self.vol_mode = vol_mode
         n_active = sum(1 for w in self.weights.values() if w > 0)
         self.required = math.ceil(sc.MIN_BULLISH_INDICATORS / 6 * n_active)
         self.adx_gate = adx_gate
@@ -76,12 +77,23 @@ class LiveEngine:
                     "Open": last_close, "High": max(last_close, cur), "Low": min(last_close, cur),
                     "Close": cur, "Volume": float(bars["Volume"].iloc[-1]),
                 }], index=[cur_t])])
-        scores, bull, bear, adx, vwap = sc.compute_signals_series(bars, self.weights)
+        scores, bull, bear, adx, vwap = sc.compute_signals_series(bars, self.weights, self.vol_mode)
         i = len(bars) - 1
         sc_i = scores[i]
         if sc_i is None or sc_i != sc_i:        # NaN-safe
             return None
         spot = float(bars["Close"].iloc[i])
+        # broad-market regime hint (matches theta_backtest.compute_market_regime): +1 bullish
+        # (close>vwap AND ema_fast>ema_slow), -1 bearish (both down), 0 neutral/chop.
+        ema_f, ema_s = sc.compute_ema_cross(bars["Close"])
+        ef, es = float(ema_f.iloc[i]), float(ema_s.iloc[i])
+        vw_i = float(vwap[i]) if vwap[i] == vwap[i] else None
+        regime = 0
+        if vw_i is not None:
+            if spot > vw_i and ef > es:
+                regime = 1
+            elif spot < vw_i and ef < es:
+                regime = -1
         # intraday return-since-open (for cross-sectional relative-strength ranking)
         last = bars.index[i]
         same_day = bars.index.strftime("%Y%m%d") == last.strftime("%Y%m%d")
@@ -92,7 +104,7 @@ class LiveEngine:
             "score": float(sc_i), "bullish": int(bull[i]), "bearish": int(bear[i]),
             "adx": float(adx[i]) if adx[i] == adx[i] else 0.0,
             "vwap": (float(vwap[i]) if vwap[i] == vwap[i] else None),
-            "ret_open": ret_open,
+            "ret_open": ret_open, "regime": regime,
         }
 
     def entry_direction(self, st: dict) -> str | None:
