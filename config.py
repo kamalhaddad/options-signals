@@ -80,7 +80,7 @@ TAKE_PROFIT_PCT = 2.5
 # reversals, theta into the close) bleed; cutting them lifts win rate AND total return.
 SKIP_OPEN_MINUTES = 0          # 0 = trade the open (the strong open-momentum trends)
 SKIP_CLOSE_MINUTES = 15
-ENTRY_CUTOFF = ""              # no new entries after this (ET); "" = off (entries allowed all session)
+ENTRY_CUTOFF = "12:00"         # no new entries after this (ET); "" = off
 
 # Technical indicator weights (must sum to 1.0) — 6 indicators
 WEIGHTS = {
