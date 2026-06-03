@@ -35,6 +35,12 @@ class ThetaError(RuntimeError):
     pass
 
 
+# Transient Theta-upstream HTTP statuses: the Terminal's feed dropped (MDDS/FPSS) or we
+# were rate-limited, and it auto-reconnects within ~1s ("reconnect every 1 seconds" in its
+# logs). Retry these rather than failing the whole scan. 474 = connection lost to MDDS.
+RETRYABLE_STATUS = {429, 473, 474}
+
+
 class ThetaClient:
     def __init__(self, base_url: str = BASE_URL, timeout: int = 60, retries: int = 3,
                  use_cache: bool = True, cache_dir: str = CACHE_DIR, offline: bool = False):
@@ -92,10 +98,18 @@ class ThetaClient:
             for attempt in range(self.retries):
                 try:
                     r = self.s.get(next_url, params=next_params, timeout=self.timeout)
-                    break
                 except requests.RequestException as e:
                     last_exc = e
                     time.sleep(0.5 * (attempt + 1))
+                    continue
+                # Transient feed drop (474 MDDS lost, etc.) — the Terminal reconnects in
+                # ~1s; wait and retry instead of failing the scan. Persisting past retries
+                # falls through to the status handling below and raises as before.
+                if r.status_code in RETRYABLE_STATUS and attempt < self.retries - 1:
+                    last_exc = ThetaError(f"{r.status_code} for {path}: {r.text[:120]}")
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
+                break
             else:
                 raise ThetaError(f"request failed for {path}: {last_exc}")
 
