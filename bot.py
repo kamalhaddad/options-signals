@@ -183,12 +183,15 @@ def scan() -> list:
             pos = _posview(open_pos[tk])
             if st is None and not eod:
                 continue
-            reason = eng.exit_reason(pos, st, eod)
-            if reason:
-                bid = eng.current_bid(tk, pos["exp"], pos["strike"], pos["right"])
-                pnl = ((bid - pos["entry"]) / pos["entry"] * 100) if (bid and pos["entry"]) else 0.0
-                db.close_trade(open_pos[tk]["id"], bid, pnl, reason, now)
-                out.append(("exit", exit_embed(pos, reason, bid)))
+            try:
+                reason = eng.exit_reason(pos, st, eod)
+                if reason:
+                    bid = eng.current_bid(tk, pos["exp"], pos["strike"], pos["right"])
+                    pnl = ((bid - pos["entry"]) / pos["entry"] * 100) if (bid and pos["entry"]) else 0.0
+                    db.close_trade(open_pos[tk]["id"], bid, pnl, reason, now)
+                    out.append(("exit", exit_embed(pos, reason, bid)))
+            except Exception as ex:
+                log.warning(f"{tk}: exit check failed: {ex}")
             continue
 
         if st is None:
@@ -358,7 +361,13 @@ async def scanner_loop():
         log.info("market closed — skipping")
         return
     log.info("scanning…")
-    posts = await asyncio.to_thread(scan)
+    try:
+        posts = await asyncio.to_thread(scan)
+    except Exception as ex:
+        # A single ThetaData hiccup (e.g. 474 "Connection lost to MDDS") must never
+        # kill the loop — log and retry on the next interval.
+        log.error(f"scan failed, will retry next interval: {ex}")
+        return
     for kind, embed in posts:
         await channel.send(embed=embed)
         await asyncio.sleep(1)
