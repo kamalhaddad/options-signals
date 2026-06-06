@@ -8,5 +8,7 @@ services:
       - ${THETA_JAR_HOST:-./ThetaTerminal.jar}:/opt/ThetaTerminal.jar:ro
       # persist open positions across redeploys/restarts
       - ./data:/app/data
+      # persist the ThetaData response cache so a redeploy (rebuild) doesn't wipe it
+      - ./.cache:/app/.cache
     environment:
       - POSITIONS_FILE=/app/data/positions.json
