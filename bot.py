@@ -43,7 +43,8 @@ def _posview(row: dict) -> dict:
     """Adapt a DB trade row to the dict shape live_engine/exit_embed expect."""
     return {"ticker": row["ticker"], "dir": row["direction"], "exp": row["exp"],
             "strike": row["strike"], "strike_d": row["strike_d"], "right": _right(row["direction"]),
-            "entry": row["entry_px"], "exp_date": str(row.get("exp_date") or "")}
+            "entry": row["entry_px"], "exp_date": str(row.get("exp_date") or ""),
+            "entry_time": row.get("entry_time")}
 
 
 # ── embeds ───────────────────────────────────────────────────────────────────────
@@ -189,7 +190,7 @@ def scan() -> list:
             if st is None and not eod:
                 continue
             try:
-                reason = eng.exit_reason(pos, st, eod)
+                reason = eng.exit_reason(pos, st, eod, now)
                 if reason:
                     bid = eng.current_bid(tk, pos["exp"], pos["strike"], pos["right"])
                     pnl = ((bid - pos["entry"]) / pos["entry"] * 100) if (bid and pos["entry"]) else 0.0

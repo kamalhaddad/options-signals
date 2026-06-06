@@ -26,6 +26,13 @@ from thetadata_client import ThetaClient, strike_to_dollars
 
 ET = ZoneInfo("America/New_York")
 WARMUP_CALENDAR_DAYS = tb.WARMUP_CALENDAR_DAYS
+
+# Theta-aware loss-cut (validated +2.4% cur-DTE / +5% short-DTE vs the flat stop): the premium
+# stop ratchets TIGHTER as the trade ages (scaled by DTE), cutting decaying losers faster while
+# leaving the +TP untouched. Env-tunable; THETA_EXIT=0 reverts to the flat STOP_LOSS_PREMIUM_PCT.
+THETA_EXIT_ON = os.getenv("THETA_EXIT", "1") == "1"
+THETA_EXIT_INIT = float(os.getenv("THETA_EXIT_INIT", "35"))    # starting stop %% (early in the trade)
+THETA_EXIT_FLOOR = float(os.getenv("THETA_EXIT_FLOOR", "20"))  # tightest stop %% (after the trade ages)
 MIN_BARS = 40
 # Hist OHLC lags ~15min intraday even on PRO; splice the real-time snapshot as the current bar.
 USE_SNAPSHOT = os.getenv("LIVE_SNAPSHOT", "1") != "0"
@@ -119,16 +126,30 @@ class LiveEngine:
             return "PUT"
         return None
 
-    def exit_reason(self, pos: dict, st: dict, is_eod: bool) -> str | None:
+    def exit_reason(self, pos: dict, st: dict, is_eod: bool, now=None) -> str | None:
         """Mirror theta_backtest exits for an open position given the latest bid + signal.
-        `pos` carries entry premium and direction; `st` is latest() for the same ticker."""
+        `pos` carries entry premium and direction; `st` is latest() for the same ticker.
+        `now` (ET datetime) enables the theta-aware loss-cut — the stop ratchets tighter as the
+        trade ages (scaled by DTE); falls back to the flat stop if timing data is unavailable."""
         bid = self.current_bid(pos["ticker"], pos["exp"], pos["strike"], pos["right"])
         if bid is not None and pos["entry"] > 0:
             pnl = (bid - pos["entry"]) / pos["entry"] * 100
             if pnl >= sc.TAKE_PROFIT_PREMIUM_PCT:
                 return f"take profit (+{pnl:.0f}% prem)"
-            if pnl <= -sc.STOP_LOSS_PREMIUM_PCT:
-                return f"stop loss ({pnl:.0f}% prem)"
+            # theta-aware loss-cut: eff_stop tightens from -INIT toward -FLOOR over dte*12 bars
+            # (short-DTE tightens fast). Fail-safe: any bad/missing timing -> flat stop.
+            eff_stop = sc.STOP_LOSS_PREMIUM_PCT
+            if THETA_EXIT_ON and now is not None and pos.get("entry_time") is not None and pos.get("exp_date"):
+                try:
+                    held = max(0.0, (now - pos["entry_time"]).total_seconds() / 300.0)
+                    dte = max(1, (pd.Timestamp(pos["exp_date"]).date() - now.date()).days)
+                    progress = min(1.0, held / (dte * 12.0))
+                    eff_stop = THETA_EXIT_INIT - (THETA_EXIT_INIT - THETA_EXIT_FLOOR) * progress
+                except Exception:
+                    eff_stop = sc.STOP_LOSS_PREMIUM_PCT
+            if pnl <= -eff_stop:
+                tag = "theta stop" if eff_stop != sc.STOP_LOSS_PREMIUM_PCT else "stop loss"
+                return f"{tag} ({pnl:.0f}% prem)"
         if st is not None and st["score"] is not None:
             if pos["dir"] == "CALL" and st["score"] <= sc.SELL_THRESHOLD:
                 return "opposite signal"
