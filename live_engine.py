@@ -33,6 +33,12 @@ WARMUP_CALENDAR_DAYS = tb.WARMUP_CALENDAR_DAYS
 THETA_EXIT_ON = os.getenv("THETA_EXIT", "1") == "1"
 THETA_EXIT_INIT = float(os.getenv("THETA_EXIT_INIT", "35"))    # starting stop %% (early in the trade)
 THETA_EXIT_FLOOR = float(os.getenv("THETA_EXIT_FLOOR", "20"))  # tightest stop %% (after the trade ages)
+
+# Momentum runup (validated +12% over the flat-TP exit across May/Feb/Mar-OOS): hold a winner
+# PAST +40% only while the signal still confirms continuation (score strong + price trending in
+# favor); otherwise take the +40%. Stateless — decided each scan, matching the runup_sl backtest.
+RUNUP_ON = os.getenv("RUNUP", "1") == "1"
+RUNUP_FLOOR = float(os.getenv("RUNUP_FLOOR", "0.30"))          # min |score| to keep running past +40%
 MIN_BARS = 40
 # Hist OHLC lags ~15min intraday even on PRO; splice the real-time snapshot as the current bar.
 USE_SNAPSHOT = os.getenv("LIVE_SNAPSHOT", "1") != "0"
@@ -135,7 +141,18 @@ class LiveEngine:
         if bid is not None and pos["entry"] > 0:
             pnl = (bid - pos["entry"]) / pos["entry"] * 100
             if pnl >= sc.TAKE_PROFIT_PREMIUM_PCT:
-                return f"take profit (+{pnl:.0f}% prem)"
+                # momentum runup: ride past +40% only while the signal still confirms continuation;
+                # else take the +40%. Stateless (decided from `st` each scan) = the validated runup_sl.
+                is_call = pos["dir"] == "CALL"
+                s_score = (st or {}).get("score")
+                s_vwap = (st or {}).get("vwap")
+                s_spot = (st or {}).get("spot")
+                strong = s_score is not None and ((s_score >= RUNUP_FLOOR) if is_call else (s_score <= -RUNUP_FLOOR))
+                trending = (s_vwap is not None and s_spot is not None
+                            and ((s_spot > s_vwap) if is_call else (s_spot < s_vwap)))
+                if not (RUNUP_ON and strong and trending):
+                    return f"take profit (+{pnl:.0f}% prem)"
+                # else: momentum strong -> hold past +40% (loss side still protected by the theta stop)
             # theta-aware loss-cut: eff_stop tightens from -INIT toward -FLOOR over dte*12 bars
             # (short-DTE tightens fast). Fail-safe: any bad/missing timing -> flat stop.
             eff_stop = sc.STOP_LOSS_PREMIUM_PCT
