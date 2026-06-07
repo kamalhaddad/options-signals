@@ -43,6 +43,21 @@ MAX_SPREAD_PCT = 4.0       # tight spread = better fills; the key execution leve
 MIN_PREMIUM = 1.00         # skip dirt-cheap options (worst % spreads / slippage)
 MIN_OPEN_INTEREST = 250    # liquidity floor
 COMMISSION_PER_CONTRACT = 0.65
+FILL_MID = False           # if True, fill entry/exit at the bid-ask MIDPOINT (limit-order ceiling) instead of crossing
+SMART_PICK = False         # if True, pick the TIGHTEST-spread contract in the OTM band across the nearest expiries
+SMART_MAX_EXP = 2          # smart-pick: search the nearest N expiries in the DTE window
+SMART_OTM_LO = 0.5         # smart-pick: candidate strike OTM band, low % (keep it OTM like the strategy)
+SMART_OTM_HI = 5.0         # smart-pick: candidate strike OTM band, high %
+SMART_MAX_STRIKES = 6      # smart-pick: candidate strikes per expiry, nearest the moneyness target
+RESCUE_ONLY = False        # if True, KEEP the default contract when it passes; only rescue failures with strict bars
+RESCUE_MAX_SPREAD = 2.5    # rescue: alternative must be at least this tight (< the 4% bar = only top-liquidity rescues)
+RESCUE_MIN_OI = 1000       # rescue: alternative must have at least this OI (>> the 250 floor)
+SCALE_OUT = False          # if True, bank SCALE_FRAC of the position at SCALE_TRIGGER and let the runner ride for the tail
+SCALE_FRAC = 0.5           # fraction of the position sold at the first profit trigger
+SCALE_TRIGGER = 40.0       # premium %% at which to scale out the first piece (default = the take-profit)
+RUNNER_TRAIL = 30.0        # trailing stop %% off the peak for the remaining runner (spike already banked, so trailing is safe)
+RUN_FLOOR = 0.30           # runup mode: min |signal score| to KEEP RUNNING past +40% (continuation evidence)
+RUN_TRAIL = 25.0           # runup mode: trailing stop %% off peak once running past +40%
 WARMUP_BARS = 40            # 5-min bars before signals are trusted
 WARMUP_CALENDAR_DAYS = 4    # ~2 trading days back (>=150 bars) — plenty past ADX/vol-avg settle
 
@@ -162,6 +177,119 @@ class ThetaBacktest:
         otm_pct = (strike_d - spot) / spot * 100 if direction == "CALL" else (spot - strike_d) / spot * 100
         return exp, strike_int, right, otm_pct
 
+    def _bar_spread(self, root, exp, strike, right, t, date_i):
+        """(ask, bid, spread%) for the quote at/just before bar `t`, or None. Warms the
+        per-contract quote cache that _try_open reuses (so no extra Terminal call)."""
+        q = self.option_quotes(root, exp, strike, right, date_i)
+        if q is None or q.empty:
+            return None
+        sub = q[q.index <= t]
+        if sub.empty:
+            return None
+        ask, bid = float(sub.iloc[-1]["ask"]), float(sub.iloc[-1]["bid"])
+        if ask <= 0:
+            return None
+        mid = (ask + bid) / 2
+        return ask, bid, ((ask - bid) / mid * 100 if mid > 0 else 999.0)
+
+    def pick_contract_smart(self, root, t, spot, direction, moneyness,
+                            max_spread, min_premium, min_oi, iv_max):
+        """Liquidity-aware pick: among strikes in the OTM band across the nearest expiries,
+        return the contract with the TIGHTEST spread that passes every bar (premium/spread/
+        OI/IV). Same quality bars as the default picker — it just stops discarding a signal
+        when the single nearest strike is wide but an equally-OTM neighbor is tight."""
+        right = "C" if direction == "CALL" else "P"
+        bar_date = t.normalize()
+        date_i = int(t.strftime("%Y%m%d"))
+        exps = sorted((e for e in self.expirations(root)
+                       if EXPIRY_MIN_DAYS <= (exp_to_date(e) - bar_date).days <= EXPIRY_MAX_DAYS),
+                      key=lambda e: (exp_to_date(e) - bar_date).days)[:SMART_MAX_EXP]
+        if not exps:
+            return None
+        target = spot * (1 + moneyness / 100) if direction == "CALL" else spot * (1 - moneyness / 100)
+        if direction == "CALL":
+            lo, hi = spot * (1 + SMART_OTM_LO / 100), spot * (1 + SMART_OTM_HI / 100)
+        else:
+            lo, hi = spot * (1 - SMART_OTM_HI / 100), spot * (1 - SMART_OTM_LO / 100)
+        best = None   # (spread, dist_to_target, exp, strike, otm_pct)
+        for exp in exps:
+            band = [(s, strike_to_dollars(s)) for s in self.strikes(root, exp)]
+            band = sorted(((s, d) for s, d in band if lo <= d <= hi), key=lambda x: abs(x[1] - target))
+            for s, d in band[:SMART_MAX_STRIKES]:
+                r = self._bar_spread(root, exp, s, right, t, date_i)
+                if r is None:
+                    continue
+                ask, bid, spread = r
+                if ask < min_premium or spread > max_spread:
+                    continue
+                if min_oi > 0 and self._oi(root, exp, s, right, date_i) < min_oi:
+                    continue
+                iv = self._iv(root, exp, s, right, date_i)
+                if iv is not None and iv > iv_max:
+                    continue
+                otm = (d - spot) / spot * 100 if direction == "CALL" else (spot - d) / spot * 100
+                cand = (spread, abs(d - target), exp, s, otm)
+                if best is None or cand[:2] < best[:2]:
+                    best = cand
+        if best is None:
+            return None
+        return best[2], best[3], right, best[4]
+
+    def pick_contract_rescue(self, root, t, spot, direction, moneyness,
+                             max_spread, min_premium, min_oi, iv_max):
+        """Default-first SELECTIVE rescue: keep the deterministic nearest contract whenever it
+        clears the normal bars (so the baseline book is preserved exactly). Only when it FAILS
+        do we add a trade — and only on a HIGH-quality alternative (spread <= RESCUE_MAX_SPREAD,
+        OI >= RESCUE_MIN_OI). Adds a few good trades without diluting ROI with marginal ones."""
+        right = "C" if direction == "CALL" else "P"
+        bar_date = t.normalize()
+        date_i = int(t.strftime("%Y%m%d"))
+        default = self.pick_contract(root, t, spot, direction, moneyness)
+        if default:
+            exp, strike, _r, _otm = default
+            r = self._bar_spread(root, exp, strike, right, t, date_i)
+            if r is not None:
+                ask, _bid, spread = r
+                if (ask >= min_premium and spread <= max_spread
+                        and (min_oi <= 0 or self._oi(root, exp, strike, right, date_i) >= min_oi)):
+                    iv = self._iv(root, exp, strike, right, date_i)
+                    if iv is None or iv <= iv_max:
+                        return default                       # default clears bars -> keep it
+        # default failed -> rescue, but only with STRICT quality bars
+        exps = sorted((e for e in self.expirations(root)
+                       if EXPIRY_MIN_DAYS <= (exp_to_date(e) - bar_date).days <= EXPIRY_MAX_DAYS),
+                      key=lambda e: (exp_to_date(e) - bar_date).days)[:SMART_MAX_EXP]
+        if not exps:
+            return None
+        target = spot * (1 + moneyness / 100) if direction == "CALL" else spot * (1 - moneyness / 100)
+        if direction == "CALL":
+            lo, hi = spot * (1 + SMART_OTM_LO / 100), spot * (1 + SMART_OTM_HI / 100)
+        else:
+            lo, hi = spot * (1 - SMART_OTM_HI / 100), spot * (1 - SMART_OTM_LO / 100)
+        best = None
+        for exp in exps:
+            band = sorted(((s, strike_to_dollars(s)) for s in self.strikes(root, exp)
+                           if lo <= strike_to_dollars(s) <= hi), key=lambda x: abs(x[1] - target))
+            for s, d in band[:SMART_MAX_STRIKES]:
+                r = self._bar_spread(root, exp, s, right, t, date_i)
+                if r is None:
+                    continue
+                ask, _bid, spread = r
+                if ask < min_premium or spread > RESCUE_MAX_SPREAD:
+                    continue
+                if self._oi(root, exp, s, right, date_i) < RESCUE_MIN_OI:
+                    continue
+                iv = self._iv(root, exp, s, right, date_i)
+                if iv is not None and iv > iv_max:
+                    continue
+                otm = (d - spot) / spot * 100 if direction == "CALL" else (spot - d) / spot * 100
+                cand = (spread, abs(d - target), exp, s, otm)
+                if best is None or cand[:2] < best[:2]:
+                    best = cand
+        if best is None:
+            return None
+        return best[2], best[3], right, best[4]
+
     # ── per-ticker backtest ───────────────────────────────────────────────────
     def run_ticker(self, root: str, start: int, end: int,
                    weights=None, required=None, adx_gate=0.0,
@@ -172,7 +300,7 @@ class ThetaBacktest:
                    gex_intraday=None, gex_size=False, gex_walls=False, gex_wall_tp=True,
                    gex_max_dte=14, rs_bars=None, rs_lag_bars=None,
                    exit_mode="baseline", decay_floor=0.15, catastrophic=60.0,
-                   be_trigger=25.0, init_stop=35.0, ref_iv=0.6,
+                   be_trigger=25.0, init_stop=35.0, ref_iv=0.6, theta_floor=20.0,
                    vol_mode="current", put_required=None) -> list[dict]:
         warm_start = int((pd.Timestamp(str(start)) - pd.Timedelta(days=WARMUP_CALENDAR_DAYS)).strftime("%Y%m%d"))
         bars = self.c.stock_ohlc(root, warm_start, end)
@@ -211,7 +339,34 @@ class ThetaBacktest:
                 if bid is not None and pos["entry"] > 0:
                     pos["peak"] = max(pos.get("peak", pos["entry"]), bid)
                     pnl = (bid - pos["entry"]) / pos["entry"] * 100
-                    if exit_mode == "baseline":
+
+                    if SCALE_OUT and not pos.get("scaled_out") and pnl >= SCALE_TRIGGER:
+                        # bank a fraction at the trigger (captures the spike that round-trips);
+                        # the runner stays open for the gamma fat tail.
+                        if FILL_MID:
+                            ax = self._quote_at(pos, t, "ask")
+                            pfill = (bid + ax) / 2 if ax is not None else bid
+                        else:
+                            pfill = bid * (1 - slippage / 100)
+                        sold = pos["qty"] * SCALE_FRAC
+                        trades.append(self._close({**pos, "qty": sold}, t, pfill,
+                                                  f"scale-out (+{pnl:.0f}% prem)", spot, i - pos["entry_i"]))
+                        pos["qty"] -= sold
+                        pos["scaled_out"] = True
+                    elif pos.get("scaled_out"):
+                        # RUNNER: trail the peak for the tail (the spike is banked, so no clip risk),
+                        # plus the loss-cut (theta or fixed) so a reversal doesn't give it all back.
+                        drop = (pos["peak"] - bid) / pos["peak"] * 100 if pos["peak"] else 0.0
+                        if drop >= RUNNER_TRAIL:
+                            exit_reason = f"runner trail (+{pnl:.0f}% prem)"
+                        elif exit_mode == "theta":
+                            r = self._adaptive_exit_reason(pos, bid, pnl, score, spot, vwap_vals[i],
+                                trail, exit_mode, decay_floor, catastrophic, be_trigger, init_stop,
+                                i - pos["entry_i"], theta_floor)
+                            exit_reason = r if (r and "take profit" not in r) else None  # runner doesn't re-TP
+                        elif pnl <= -sc.STOP_LOSS_PREMIUM_PCT:
+                            exit_reason = f"stop loss ({pnl:.0f}% prem)"
+                    elif exit_mode == "baseline":
                         if pnl >= sc.TAKE_PROFIT_PREMIUM_PCT:
                             exit_reason = f"take profit (+{pnl:.0f}% prem)"
                         elif trail > 0:
@@ -223,7 +378,8 @@ class ThetaBacktest:
                     else:
                         exit_reason = self._adaptive_exit_reason(
                             pos, bid, pnl, score, spot, vwap_vals[i], trail,
-                            exit_mode, decay_floor, catastrophic, be_trigger, init_stop)
+                            exit_mode, decay_floor, catastrophic, be_trigger, init_stop,
+                            i - pos["entry_i"], theta_floor)
                 if exit_reason is None and pos.get("target_level") is not None:
                     tl = pos["target_level"]
                     if (pos["dir"] == "CALL" and spot >= tl) or (pos["dir"] == "PUT" and spot <= tl):
@@ -236,8 +392,13 @@ class ThetaBacktest:
                 if exit_reason is None and is_last_of_day:
                     exit_reason = "end of day"
                 if exit_reason is not None:
-                    raw = bid if bid is not None else pos["entry"]
-                    exit_fill = raw * (1 - slippage / 100)   # fill worse than bid
+                    if FILL_MID:
+                        ask_x = self._quote_at(pos, t, "ask")
+                        exit_fill = ((bid + ask_x) / 2 if (bid is not None and ask_x is not None)
+                                     else (bid if bid is not None else pos["entry"]))
+                    else:
+                        raw = bid if bid is not None else pos["entry"]
+                        exit_fill = raw * (1 - slippage / 100)   # fill worse than bid
                     trades.append(self._close(pos, t, exit_fill, exit_reason, spot, i - pos["entry_i"]))
                     in_trade = False
                     pos = {}
@@ -324,7 +485,8 @@ class ThetaBacktest:
 
     @staticmethod
     def _adaptive_exit_reason(pos, bid, pnl, score, spot, vw, trail,
-                              mode, decay_floor, catastrophic, be_trigger, init_stop):
+                              mode, decay_floor, catastrophic, be_trigger, init_stop,
+                              held=0, theta_floor=20.0):
         """Smarter exits than the fixed +TP/-SL cap. Returns a reason string or None.
         All modes share a catastrophic premium backstop; then per-mode logic:
           decay   — ride until the entry momentum fades (score < floor or lost VWAP)
@@ -338,6 +500,66 @@ class ThetaBacktest:
         is_call = pos["dir"] == "CALL"
         if pnl <= -catastrophic:
             return f"catastrophic ({pnl:.0f}% prem)"
+
+        if mode == "theta":
+            # Intelligent LOSS-cut, upside UNCAPPED-by-this-mode (keep the +TP that captures the
+            # spiky gamma winners): the stop RATCHETS TIGHTER as the trade ages, scaled by DTE so
+            # fast-decaying short-DTE losers are cut quickly while longer-DTE gets room.
+            if pnl >= sc.TAKE_PROFIT_PREMIUM_PCT:
+                return f"take profit (+{pnl:.0f}% prem)"
+            dte = max(1, pos.get("dte", 7))
+            horizon = dte * 12.0                       # ~1h (12 bars) of room per DTE-day to full-tighten
+            progress = min(1.0, held / horizon) if horizon > 0 else 1.0
+            eff_stop = init_stop - (init_stop - theta_floor) * progress   # init_stop -> theta_floor over time
+            if pnl <= -eff_stop:
+                return f"theta stop ({pnl:.0f}% prem @ -{eff_stop:.0f})"
+            return None
+
+        if mode == "runup_sl":
+            # STATELESS runup (live-portable: no peak/running memory, decided each scan from the
+            # current signal): hold past +40% only while momentum is strong; take +40% the moment
+            # it fades. Downside = the theta stop. Mirrors what live_engine can compute each scan.
+            is_call = pos["dir"] == "CALL"
+            if pnl >= sc.TAKE_PROFIT_PREMIUM_PCT:
+                strong = score is not None and ((score >= RUN_FLOOR) if is_call else (score <= -RUN_FLOOR))
+                vwap_ok = (vw == vw) and ((spot > vw) if is_call else (spot < vw))
+                if not (strong and vwap_ok):
+                    return f"take profit (+{pnl:.0f}% prem)"
+            dte = max(1, pos.get("dte", 7))
+            progress = min(1.0, held / (dte * 12.0))
+            eff_stop = init_stop - (init_stop - theta_floor) * progress
+            if pnl <= -eff_stop:
+                return f"theta stop ({pnl:.0f}% prem @ -{eff_stop:.0f})"
+            return None
+
+        if mode == "runup":
+            # Capture the >+40% runners WITHOUT giving back on the spike-and-reverse: at +40%,
+            # keep running ONLY if there's continuation evidence (signal still strong + price
+            # still trending in favor); otherwise take the +40%. Once running, ride with a
+            # trailing stop and bail when momentum dies. Loss side = the theta-aware stop.
+            is_call = pos["dir"] == "CALL"
+            if pos.get("running"):
+                drop = (peak - bid) / peak * 100 if peak else 0.0
+                if drop >= RUN_TRAIL:
+                    return f"run trail (+{pnl:.0f}% prem)"
+                if score is not None:
+                    faded = (score < RUN_FLOOR) if is_call else (score > -RUN_FLOOR)
+                    lost_vwap = (vw == vw) and ((spot < vw) if is_call else (spot > vw))
+                    if faded or lost_vwap:
+                        return f"run fade (+{pnl:.0f}% prem)"
+            elif pnl >= sc.TAKE_PROFIT_PREMIUM_PCT:
+                strong = score is not None and ((score >= RUN_FLOOR) if is_call else (score <= -RUN_FLOOR))
+                vwap_ok = (vw == vw) and ((spot > vw) if is_call else (spot < vw))
+                if strong and vwap_ok:
+                    pos["running"] = True       # continuation evidence -> ride the runner
+                else:
+                    return f"take profit (+{pnl:.0f}% prem)"
+            dte = max(1, pos.get("dte", 7))
+            progress = min(1.0, held / (dte * 12.0))
+            eff_stop = init_stop - (init_stop - theta_floor) * progress
+            if pnl <= -eff_stop:
+                return f"theta stop ({pnl:.0f}% prem @ -{eff_stop:.0f})"
+            return None
 
         def decayed():
             if score is None:
@@ -384,7 +606,14 @@ class ThetaBacktest:
 
     def _try_open(self, root, t, spot, direction, score, i, moneyness=OTM_TARGET_PCT, iv_max=MAX_IV, risk=0.0,
                   slippage=0.0, max_spread=MAX_SPREAD_PCT, min_premium=MIN_PREMIUM, min_oi=0):
-        pick = self.pick_contract(root, t, spot, direction, moneyness)
+        if RESCUE_ONLY:
+            pick = self.pick_contract_rescue(root, t, spot, direction, moneyness,
+                                             max_spread, min_premium, min_oi, iv_max)
+        elif SMART_PICK:
+            pick = self.pick_contract_smart(root, t, spot, direction, moneyness,
+                                            max_spread, min_premium, min_oi, iv_max)
+        else:
+            pick = self.pick_contract(root, t, spot, direction, moneyness)
         if pick is None:
             return None
         exp, strike, right, otm_pct = pick
@@ -417,7 +646,7 @@ class ThetaBacktest:
         if iv is not None and iv > iv_max:
             return None
         # Fill worse than the ask by `slippage` % (execution realism).
-        entry_fill = entry_ask * (1 + slippage / 100)
+        entry_fill = (entry_ask + entry_bid) / 2 if (FILL_MID and entry_bid > 0) else entry_ask * (1 + slippage / 100)
         # Position sizing: risk a fixed $ per trade (equalizes risk across cheap vs
         # expensive options). Risk/contract ≈ stop% × premium × 100. risk=0 -> 1 contract.
         if risk > 0:
@@ -430,6 +659,7 @@ class ThetaBacktest:
             "otm_pct": otm_pct, "entry": entry_fill, "entry_bid": entry_bid, "qty": qty,
             "entry_time": t, "entry_spot": spot, "entry_i": i,
             "score": round(score, 3), "quotes": quotes, "iv": iv,
+            "dte": max(0, (exp_to_date(exp) - t.normalize()).days),
         }
 
     def _ticker_profile(self, root, day, ref_spot, max_dte):
@@ -521,6 +751,7 @@ def rs_leader_sets(client, tickers, start, end, quantile):
 
 
 def main():
+    global EXPIRY_MIN_DAYS, EXPIRY_MAX_DAYS
     ap = argparse.ArgumentParser(description="Real-options backtest on ThetaData")
     ap.add_argument("--tickers", default="NVDA", help="comma-separated, or 'all' for the watchlist")
     ap.add_argument("--start", required=True, help="YYYY-MM-DD")
@@ -533,7 +764,10 @@ def main():
     ap.add_argument("--tp", type=float, default=sc.TAKE_PROFIT_PREMIUM_PCT, help="take-profit %% on premium")
     ap.add_argument("--signals", default="trend_clean", choices=list(SIGNAL_PRESETS), help="signal preset")
     ap.add_argument("--adx-gate", type=float, default=30.0, help="skip entries when ADX below this (0=off)")
-    ap.add_argument("--moneyness", type=float, default=OTM_TARGET_PCT, help="strike %% from spot: +OTM / -ITM")
+    ap.add_argument("--moneyness", type=float, default=OTM_TARGET_PCT, help="strike %% from spot: +OTM / -ITM (negative=ITM=higher delta)")
+    ap.add_argument("--min-dte", type=int, default=EXPIRY_MIN_DAYS, help="min days-to-expiry for the contract pick")
+    ap.add_argument("--max-dte", type=int, default=EXPIRY_MAX_DAYS, help="max days-to-expiry (raise both for longer-DTE/less-theta)")
+    ap.add_argument("--fill-mid", action="store_true", help="fill entry/exit at bid-ask MIDPOINT (limit-order ceiling) instead of crossing the spread")
     ap.add_argument("--vwap-gate", action="store_true", help="only CALL above VWAP / PUT below VWAP")
     ap.add_argument("--trail", type=float, default=0.0, help="trailing stop %% off premium peak (0=fixed stop)")
     ap.add_argument("--iv-max", type=float, default=MAX_IV, help="skip options with IV above this (e.g. 0.6)")
@@ -558,7 +792,15 @@ def main():
     ap.add_argument("--no-bulk", action="store_true", help="per-contract pulls instead of bulk-per-exp-day (slower; for parity/debug)")
     ap.add_argument("--rs", type=float, default=None, help="cross-sectional relative-strength gate: only enter top-X%% leaders (e.g. 0.5)")
     # ── adaptive exits (smarter than the fixed +TP/-SL cap) ───────────────────
-    ap.add_argument("--exit-mode", choices=["baseline", "decay", "ratchet", "vol", "combo"], default="baseline",
+    ap.add_argument("--theta-floor", type=float, default=20.0,
+                    help="theta mode: the tightest the stop ratchets to as the trade ages (premium %%)")
+    ap.add_argument("--run-floor", type=float, default=0.30, help="runup: min |score| to keep running past +40%")
+    ap.add_argument("--run-trail", type=float, default=25.0, help="runup: trailing stop %% off peak once running past +40%")
+    ap.add_argument("--scale-out", action="store_true", help="bank --scale-frac at --scale-trigger, let the runner ride for the tail")
+    ap.add_argument("--scale-frac", type=float, default=0.5, help="fraction of position sold at the scale trigger")
+    ap.add_argument("--scale-trigger", type=float, default=sc.TAKE_PROFIT_PREMIUM_PCT, help="premium %% to scale out the first piece")
+    ap.add_argument("--runner-trail", type=float, default=30.0, help="trailing stop %% off peak for the runner")
+    ap.add_argument("--exit-mode", choices=["baseline", "decay", "ratchet", "vol", "combo", "theta", "runup", "runup_sl"], default="baseline",
                     help="exit strategy: baseline=fixed TP/SL (+trail); decay=exit when signal fades; "
                          "ratchet=breakeven+trail lock-in; vol=IV-scaled brackets; combo=vol-stop+decay-TP+breakeven")
     ap.add_argument("--decay-floor", type=float, default=0.15, help="decay/combo: exit when |score| falls below this (momentum gone)")
@@ -572,7 +814,23 @@ def main():
                          "conviction=volume scores but is excluded from breadth (symmetric)")
     ap.add_argument("--put-min-conv", type=int, default=None,
                     help="separate breadth requirement for PUTs only (asymmetric short-side relax; None = same as CALL)")
+    ap.add_argument("--smart-pick", action="store_true",
+                    help="liquidity-aware contract pick: tightest-spread strike in the OTM band across nearest expiries "
+                         "(adds trades the deterministic picker discards on a wide quote; same spread/OI bars)")
+    ap.add_argument("--rescue", action="store_true",
+                    help="default-first SELECTIVE rescue: keep the default contract when it passes; only add a trade "
+                         "when it fails AND a high-quality alternative exists (--rescue-max-spread / --rescue-min-oi)")
+    ap.add_argument("--rescue-max-spread", type=float, default=2.5, help="rescue: max spread %% for an added trade")
+    ap.add_argument("--rescue-min-oi", type=int, default=1000, help="rescue: min OI for an added trade")
     args = ap.parse_args()
+    global FILL_MID, SCALE_OUT, SCALE_FRAC, SCALE_TRIGGER, RUNNER_TRAIL, RUN_FLOOR, RUN_TRAIL, SMART_PICK
+    global RESCUE_ONLY, RESCUE_MAX_SPREAD, RESCUE_MIN_OI
+    EXPIRY_MIN_DAYS, EXPIRY_MAX_DAYS = args.min_dte, args.max_dte
+    FILL_MID = args.fill_mid
+    SMART_PICK = args.smart_pick
+    RESCUE_ONLY, RESCUE_MAX_SPREAD, RESCUE_MIN_OI = args.rescue, args.rescue_max_spread, args.rescue_min_oi
+    SCALE_OUT, SCALE_FRAC, SCALE_TRIGGER, RUNNER_TRAIL = args.scale_out, args.scale_frac, args.scale_trigger, args.runner_trail
+    RUN_FLOOR, RUN_TRAIL = args.run_floor, args.run_trail
     sc.SKIP_OPEN_MINUTES = args.skip_open
     sc.SKIP_CLOSE_MINUTES = args.skip_close
     entry_cutoff_min = None
@@ -667,7 +925,7 @@ def main():
             rs_bars=(rs_leaders.get(tk) if rs_leaders is not None else None),
             rs_lag_bars=(rs_laggards.get(tk) if rs_laggards is not None else None),
             exit_mode=args.exit_mode, decay_floor=args.decay_floor, catastrophic=args.catastrophic,
-            be_trigger=args.be_trigger, init_stop=args.init_stop, ref_iv=args.ref_iv,
+            be_trigger=args.be_trigger, init_stop=args.init_stop, ref_iv=args.ref_iv, theta_floor=args.theta_floor,
             vol_mode=args.vol_mode, put_required=args.put_min_conv)
 
     done = 0

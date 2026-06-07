@@ -43,6 +43,15 @@ MIN_BARS = 40
 # Hist OHLC lags ~15min intraday even on PRO; splice the real-time snapshot as the current bar.
 USE_SNAPSHOT = os.getenv("LIVE_SNAPSHOT", "1") != "0"
 
+# Selective contract rescue (validated +~16% trades at HELD total profit %, all 5 months positive):
+# when the default nearest-strike contract fails the liquidity gate, ADD the trade only if a
+# high-quality alternative sits nearby (spread <= RESCUE_MAX_SPREAD AND OI >= RESCUE_MIN_OI) across
+# the nearest expiries / OTM band. Default-first, so existing accepted trades are unchanged — it only
+# adds. RESCUE=0 reverts to the plain deterministic picker. Thresholds env-tunable.
+RESCUE_ON = os.getenv("RESCUE", "1") == "1"
+tb.RESCUE_MAX_SPREAD = float(os.getenv("RESCUE_MAX_SPREAD", str(tb.RESCUE_MAX_SPREAD)))
+tb.RESCUE_MIN_OI = int(os.getenv("RESCUE_MIN_OI", str(tb.RESCUE_MIN_OI)))
+
 
 def today_et() -> int:
     return int(datetime.now(ET).strftime("%Y%m%d"))
@@ -181,7 +190,13 @@ class LiveEngine:
         """Pick the contract (nearest 3-14 DTE, ~2% OTM) and its current ask/bid, applying the
         liquidity gates (premium ≥ $1, spread < 6%, OI ≥ 250). None if nothing qualifies."""
         day = date_i or today_et()
-        pick = self.bt.pick_contract(ticker, t, spot, direction, self.moneyness)
+        if RESCUE_ON:
+            # default-first selective rescue; iv_max=inf so the default path matches the plain
+            # picker exactly (no IV cap live) — rescue only ADDS high-liquidity alternatives.
+            pick = self.bt.pick_contract_rescue(ticker, t, spot, direction, self.moneyness,
+                                                self.max_spread, self.min_premium, self.min_oi, float("inf"))
+        else:
+            pick = self.bt.pick_contract(ticker, t, spot, direction, self.moneyness)
         if not pick:
             return None
         exp, strike, right, otm = pick
