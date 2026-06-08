@@ -963,8 +963,10 @@ def main():
     win_pcts, loss_pcts = [], []
     tot_pct = 0.0
     tot_usd = 0.0
+    tot_deployed = 0.0
     for i, tr in enumerate(all_trades, 1):
         tot_pct += tr["pnl_pct"]; tot_usd += tr["pnl_usd"]
+        tot_deployed += tr["entry"] * 100 * tr.get("qty", 1)   # premium paid = capital at risk
         (win_pcts if tr["pnl_pct"] > 0 else loss_pcts).append(tr["pnl_pct"])
         exp_s = exp_to_date(tr["exp"]).strftime("%Y-%m-%d")
         emit(f"  {i:<3} {tr['ticker']:<5} {tr['type']:<4} ${tr['strike']:<7.0f} {exp_s:<10} "
@@ -976,13 +978,15 @@ def main():
     avg_loss = sum(loss_pcts) / len(loss_pcts) if loss_pcts else 0.0
     wl = (avg_win / -avg_loss) if avg_loss else 0.0
     expectancy = tot_pct / n if n else 0.0
+    roi = (tot_usd / tot_deployed * 100) if tot_deployed else 0.0   # capital-weighted = the real ROI
     emit(f"\n  {'='*64}")
-    emit(f"  SUMMARY  (per-trade % return on premium — the edge metric)")
+    emit(f"  SUMMARY")
     emit(f"  {'='*64}")
     emit(f"  Trades:      {n}   |   Win rate: {(len(win_pcts)/n*100 if n else 0):.0f}%")
-    emit(f"  Avg/trade:   {expectancy:+.1f}%   <-- expectancy per trade")
+    emit(f"  Net P&L:     ${tot_usd:+,.0f}   |   Capital deployed: ${tot_deployed:,.0f}")
+    emit(f"  TOTAL PROFIT %: {roi:+.1f}%   <-- net $ / capital deployed (the real ROI)")
+    emit(f"  Avg/trade:   {expectancy:+.1f}%  (equal-weight per-trade %, ignores position size)")
     emit(f"  Avg win:     {avg_win:+.1f}%   |   Avg loss: {avg_loss:+.1f}%   |   W:L {wl:.2f}x")
-    emit(f"  Total:       {tot_pct:+.0f}% (sum of per-trade %, 1-ct equal-weight)   |   ${tot_usd:+.0f} net")
     emit(f"  {'='*64}")
 
     # Persist the human-readable report (default: backtest.log; overwritten each run).
